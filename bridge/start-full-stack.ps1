@@ -41,12 +41,12 @@ $BridgeHealth  = 'http://127.0.0.1:8765/api/health'
 $BridgeStatus  = 'http://127.0.0.1:8765/api/dh/status'
 $BridgeBalance = 'http://127.0.0.1:8765/api/balance'
 $DshPort       = 3080
-# 新版（v013）与旧版（rc.8）harness 位置；-Rc8 时互换
+# 本机 harness 位置（D:\kaiyuan\deepseek-harness）；-Rc8 用旧 profile 名
 if ($Rc8) {
-    $Harness = 'E:\DSH\deepseek-harness'
+    $Harness = 'D:\kaiyuan\deepseek-harness'
     $Profile = 'web'
 } else {
-    $Harness = 'E:\DSH\deepseek-harness-v013'
+    $Harness = 'D:\kaiyuan\deepseek-harness'
     $Profile = 'web-v013'
 }
 $Result = [ordered]@{}
@@ -222,7 +222,8 @@ if ($NoDsh) {
     $log = Join-Path $Harness "dsh-web-$Profile.log"
     if (Test-Path $log) { Remove-Item $log -Force -ErrorAction SilentlyContinue }
     Say "      启动中（首次约 10-40 秒）..."
-    $cmd = "cd /d `"$Harness`" && set OPENAI_BASE_URL=https://apihub.agnes-ai.com/v1 && set OPENAI_API_KEY= && call `"$pnpm`" dsh --profile $Profile --no-open >> `"$log`" 2>&1"
+    # LLM 上游：Qwen3.8-27B（远端 vLLM，OpenAI 兼容；原 apihub.agnes-ai.com 已弃用）
+    $cmd = "cd /d `"$Harness`" && set OPENAI_BASE_URL=http://192.168.2.218:11435/v1 && set OPENAI_API_KEY=EMPTY && call `"$pnpm`" dsh --profile $Profile --no-open >> `"$log`" 2>&1"
     Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $cmd -WindowStyle Minimized
     $up = $false
     for ($i = 0; $i -lt 90; $i++) {

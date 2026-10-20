@@ -1,0 +1,174 @@
+# =============================================================================
+# DSH 语音 AI 女友 · 全栈 Docker Compose
+# =============================================================================
+# 服务拓扑（对应原 README 架构图）：
+#
+#   DSH Web (:3080, 宿主机 pnpm 启动，见 bridge/start-full-stack.ps1)
+#        │  浏览器插件（STT/TTS/数字人/QQ 全走桥接）
+#        ▼
+#   voice-bridge (:8765, 本文件) ──┬── FunASR STT（GPU）
+#                                  ├── TTS：CosyVoice（远端 H100 :8300）★新
+#                                  │        回退：OmniVoice（WSL2） / Qwen3-TTS（本地）
+#                                  ├── LLM：Qwen3.8-27B（远端 vLLM :11435）★新
+#                                  └── DUIX 数字人 ──▶ duix-avatar-gen-video（本文件）
+#
+#   ★ LLM 切换：DSH Web 启动时设
+#       OPENAI_BASE_URL=http://192.168.2.218:11435/v1  OPENAI_API_KEY=EMPTY
+#
+# 使用：
+#   1) cp bridge/bridge-config.docker.example.json bridge/bridge-config.json
+#   2) docker compose up -d --build voice-bridge   # DUIX 镜像已存在则直接 up -d
+#   3) docker compose logs -f voice-bridge
+#   4) curl http://127.0.0.1:8765/api/health
+#
+# 挂载点约定（路径可用 .env 覆盖）：
+#   assets/            → /app/assets          待机动画 + 任务视频
+#   voices（宿主）      → /app/voices          音色库（含 cosyvoice.json 音色）
+#   models（宿主）      → /app/models          FunASR / Qwen3-TTS 模型权重
+#   D:/duix_avatar_data → /duix_data          与 DUIX 容器共享的形象/产物目录
+# =============================================================================
+
+name: dsh-voice-ai-girlfriend
+
+networks:
+  ai_network:
+    driver: bridge
+
+services:
+
+  # ==================== 语音桥接（GPU：FunASR） ====================
+  voice-bridge:
+    build:
+      context: ./bridge
+      args:
+        BASE_IMAGE: ${VOICE_BRIDGE_BASE_IMAGE:-flashhead-base:cu128}
+    image: voice-bridge:latest
+    container_name: voice-bridge
+    restart: unless-stopped
+
+    environment:
+      - HF_ENDPOINT=https://hf-mirror.com
+      # 不要开 expandable_segments（WSL2/Windows 下 CUDACachingAllocator 会崩溃）
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+
+    ports:
+      # 只绑本机回环：浏览器插件直接访问 http://127.0.0.1:8765
+      - "127.0.0.1:8765:8765"
+
+    volumes:
+      # 代码热挂载（改完 restart 容器即生效，免重建镜像）
+      - ./bridge/voice_bridge.py:/app/voice_bridge.py:ro
+      - ./bridge/qq_bridge.py:/app/qq_bridge.py:ro
+      # 配置（从 bridge-config.docker.example.json 复制而来，容器内路径版）
+      - ./bridge/bridge-config.json:/app/bridge-config.json:ro
+      - ./bridge/logs:/app/logs
+      # 静态资源 / 音色库 / 模型权重（路径按宿主实际位置用 .env 覆盖）
+      - ./assets:/app/assets
+      - ${VOICES_DIR_HOST:-D:/speech-to-speech/voices}:/app/voices
+      - ${MODELS_DIR_HOST:-D:/speech-to-speech/models}:/app/models
+      # 与 DUIX 容器共享的数据卷（桥接写 wav/读成品视频，DUIX 生成口播）
+      - ${DUIX_DATA_DIR:-D:/duix_avatar_data}:/duix_data
+      # 桥接管理 DUIX 容器（启停/状态检查）需要 docker CLI + socket
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    shm_size: '4g'
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    networks:
+      - ai_network
+
+  # ==================== DUIX 数字人引擎（GPU） ====================
+  # 原样迁自 bridge/docker-compose-5060ti.yml（RTX 50 系适配版），改动仅：
+  #   - 加入 ai_network（与 voice-bridge 互通，桥接走服务名 :8383 访问）
+  #   - TTS/ASR 仍由 voice-bridge 负责（镜像已精简，无重复模型）
+  duix-avatar-gen-video:
+    image: guiji2025/duix.avatar-5090:trt10.9
+    container_name: duix-avatar-gen-video
+    restart: always
+    privileged: true
+
+    volumes:
+      - ${DUIX_DATA_DIR:-D:/duix_avatar_data}/face2face:/code/data
+      - ${DUIX_DATA_DIR:-D:/duix_avatar_data}/face2face/config.ini:/code/config/config.ini
+      # slim 镜像不带推理参数模板（任务失败：No such file or directory:
+      # /code/json_txt/param.json），宿主提供一份，字段与 config.ini 对应
+      - ./runtime/duix-json-txt/param.json:/code/json_txt/param.json
+
+    environment:
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      # onnxruntime CUDA/TRT provider 需要这些库在 LD_LIBRARY_PATH 里，否则
+      # 全部 fallback 到 CPU（实测可差 3-10x）。nvidia pip 包的 lib 目录：
+      # tensorrt_libs 是 tensorrt-cu12==10.9.0.34 的库（匹配 ORT 1.19 的 so.10）：
+      - LD_LIBRARY_PATH=/usr/local/lib/python3.9/dist-packages/tensorrt_libs:/usr/local/lib/python3.9/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.9/dist-packages/nvidia/cublas/lib:/usr/local/lib/python3.9/dist-packages/nvidia/curand/lib:/usr/local/lib/python3.9/dist-packages/nvidia/cufft/lib:/usr/local/lib/python3.9/dist-packages/nvidia/cuda_nvrtc/lib:/usr/local/lib/python3.9/dist-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.9/dist-packages/nvidia/cusolver/lib:/usr/local/lib/python3.9/dist-packages/nvidia/cusparse/lib:/usr/local/lib/python3.9/dist-packages/nvidia/nvjitlink/lib:/usr/local/lib/python3.9/dist-packages/nvidia/nccl/lib:/usr/local/lib/python3.9/dist-packages/nvidia/nvtx/lib:/usr/local/lib/python3.9/dist-packages/nvidia/cuda_cupti/lib:/usr/local/lib/python3.9/dist-packages/nvidia/cufile/lib
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    shm_size: '8g'
+
+    # 端口映射用 9002 → 容器 8383（本机调试用，链路本身走容器网络，不经宿主端口）：
+    #   Windows 保留段 8347-8446 含 8383，直接映射宿主 8383 会启动失败；
+    #   宿主 9000 已被 sh-asr-minio 占用 → 改用 9002。
+    #   宿主访问 http://127.0.0.1:9002，容器间访问 http://duix-avatar-gen-video:8383
+    ports:
+      - "127.0.0.1:9002:8383"
+
+    command: python /code/app_local.py
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    networks:
+      - ai_network
+
+  # ==================== NapCat QQ（可选，--profile qq 启用） ====================
+  # docker compose --profile qq up -d
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: unless-stopped
+    profiles: ["qq"]
+
+    environment:
+      - NAPCAT_UID=1000
+      - NAPCAT_GID=1000
+      - ACCOUNT=${NAPCAT_QQ:-}
+      - WEBUI_TOKEN=${NAPCAT_TOKEN:-}
+
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:6099:6099"
+
+    volumes:
+      - ${NAPCAT_DATA_DIR:-D:/napcat/data}:/app/napcat
+
+    networks:
+      - ai_network

@@ -1,0 +1,28 @@
+# voice-bridge 容器运行时依赖（固定版本，经 PyPI 清华镜像实查可用）
+# torch / torchaudio 由基础镜像提供（flashhead-base:cu128 = torch 2.10.0+cu128）
+
+# Web 服务
+fastapi==0.112.0
+uvicorn[standard]==0.30.5
+
+# 音频处理
+soundfile==0.12.1
+scipy==1.14.0
+numpy==1.26.4
+
+# HTTP 客户端（CosyVoice TTS / 远程 HTTP ASR）
+httpx==0.27.0
+
+# ASR（funasr 本地后端备用；当前默认走远程 sh_asr_service）
+funasr==1.1.4
+modelscope==1.17.0
+
+# QQ 语音 silk 编码
+pilk==0.2.4
+
+# OmniVoice 回退引擎
+gradio_client>=0.8,<2
+
+# 模型下载 / Qwen3-TTS 回退引擎
+huggingface_hub>=0.24,<1.0
+speech-to-speech==0.2.10

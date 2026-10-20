@@ -1,0 +1,214 @@
+2026-10-20 07:25:41,597 - voice_bridge - INFO - bridge log file -> /app/logs/bridge.log
+2026-10-20 07:25:41,920 - voice_bridge - INFO - DH disabled — no worker, no warmup, zero DUIX traffic
+2026-10-20 07:27:50,418 - voice_bridge - INFO - bridge log file -> /app/logs/bridge.log
+2026-10-20 07:27:50,745 - voice_bridge - INFO - DH disabled — no worker, no warmup, zero DUIX traffic
+2026-10-20 07:28:03,440 - httpx - INFO - HTTP Request: POST http://192.168.2.218:8300/v1/tts/zero_shot "HTTP/1.1 200 OK"
+2026-10-20 07:28:03,450 - voice_bridge - INFO - CosyVoice OK: voice_id=default chars=7 bytes=230480
+2026-10-20 07:28:07,127 - voice_bridge - INFO - TTS OK: 7 chars -> 2.40s wav (76844 bytes)
+2026-10-20 07:28:54,362 - httpx - INFO - HTTP Request: POST http://192.168.2.218:8300/v1/tts/zero_shot "HTTP/1.1 200 OK"
+2026-10-20 07:28:54,366 - voice_bridge - INFO - CosyVoice OK: voice_id=default chars=7 bytes=161360
+2026-10-20 07:28:54,369 - voice_bridge - INFO - TTS OK: 7 chars -> 1.68s wav (53804 bytes)
+2026-10-20 07:28:54,894 - httpx - INFO - HTTP Request: POST http://host.docker.internal:9090/asr "HTTP/1.1 200 OK"
+2026-10-20 08:23:21,062 - voice_bridge - INFO - bridge log file -> /app/logs/bridge.log
+2026-10-20 08:23:21,195 - voice_bridge - INFO - DH disabled — no worker, no warmup, zero DUIX traffic
+2026-10-20 08:23:43,758 - httpx - INFO - HTTP Request: POST http://192.168.2.218:8300/v1/tts/zero_shot "HTTP/1.1 200 OK"
+2026-10-20 08:23:43,771 - voice_bridge - INFO - CosyVoice OK: voice_id=f1f26d18-7f51-4575-be6a-1e895027a5d3 chars=7 bytes=184400
+2026-10-20 08:23:45,311 - voice_bridge - INFO - TTS OK: 7 chars -> 1.92s wav (61484 bytes)
+2026-10-20 08:23:47,802 - httpx - INFO - HTTP Request: POST http://host.docker.internal:9090/asr "HTTP/1.1 200 OK"
+2026-10-20 08:45:13,147 - voice_bridge - INFO - bridge log file -> /app/logs/bridge.log
+2026-10-20 08:45:13,519 - voice_bridge - INFO - DH worker started
+2026-10-20 08:45:13,520 - voice_bridge - INFO - DH worker started (DUIX http://duix-avatar-gen-video:8383, container=duix-avatar-gen-video, temp=/duix_data/face2face/temp, avatar=my_avatar.mp4, max_keep=200)
+2026-10-20 08:45:13,683 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=probe "HTTP/1.0 200 OK"
+2026-10-20 08:45:13,689 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=probe "HTTP/1.0 200 OK"
+2026-10-20 08:45:13,690 - voice_bridge - INFO - DH warmup: synthesizing warmup audio…
+2026-10-20 08:45:13,691 - voice_bridge - ERROR - DH warmup failed (non-fatal)
+Traceback (most recent call last):
+  File "/app/voice_bridge.py", line 1568, in _dh_warmup
+    wav = await _dh_synth_segment("数字人系统预热完成")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/voice_bridge.py", line 1336, in _dh_synth_segment
+    samples = await asyncio.to_thread(_synthesize_full, handler, seg_text)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/voice_bridge.py", line 1191, in _synthesize_full
+    from speech_to_speech.pipeline.messages import TTSInput
+ModuleNotFoundError: No module named 'speech_to_speech'
+2026-10-20 08:46:35,599 - voice_bridge - INFO - bridge log file -> /app/logs/bridge.log
+2026-10-20 08:46:35,705 - voice_bridge - INFO - DH worker started
+2026-10-20 08:46:35,706 - voice_bridge - INFO - DH worker started (DUIX http://duix-avatar-gen-video:8383, container=duix-avatar-gen-video, temp=/duix_data/face2face/temp, avatar=my_avatar.mp4, max_keep=200)
+2026-10-20 08:46:35,757 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=probe "HTTP/1.0 200 OK"
+2026-10-20 08:46:35,764 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=probe "HTTP/1.0 200 OK"
+2026-10-20 08:46:35,767 - voice_bridge - INFO - DH warmup: synthesizing warmup audio…
+2026-10-20 08:46:36,497 - httpx - INFO - HTTP Request: POST http://192.168.2.218:8300/v1/tts/zero_shot "HTTP/1.1 200 OK"
+2026-10-20 08:46:36,510 - voice_bridge - INFO - CosyVoice OK: voice_id=f1f26d18-7f51-4575-be6a-1e895027a5d3 chars=9 bytes=257360
+2026-10-20 08:46:41,597 - voice_bridge - INFO - DH synth: 2.68s audio -> 20261020084641579.wav
+2026-10-20 08:46:41,774 - httpx - INFO - HTTP Request: POST http://duix-avatar-gen-video:8383/easy/submit "HTTP/1.0 200 OK"
+2026-10-20 08:46:43,778 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:46:45,783 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:46:47,788 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:46:49,793 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:46:51,797 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:46:53,807 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:46:55,811 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:46:57,815 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:46:59,819 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:01,823 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:04,114 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:06,117 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:08,119 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:10,122 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:12,126 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:14,132 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:16,136 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:18,140 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:20,143 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:22,148 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:24,152 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:26,157 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:28,161 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:30,165 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:32,170 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:34,174 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:36,180 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:38,182 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:40,186 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:42,190 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:44,194 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:46,196 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:48,200 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:50,203 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:52,209 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:54,213 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:56,218 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:47:58,223 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:00,227 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:02,231 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:04,236 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:06,240 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:08,244 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:10,248 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:12,252 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:14,258 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:16,262 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:18,266 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:20,270 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:22,274 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:24,278 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:26,283 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:28,286 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:30,290 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:32,293 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:34,297 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:36,301 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:38,302 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:40,305 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:42,308 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-1f10c9b3-106d-4ad1-8465-00a27424f424 "HTTP/1.0 200 OK"
+2026-10-20 08:48:42,311 - voice_bridge - INFO - DH warmup: done (prewarmed TTS/wenet/DUIX)
+2026-10-20 08:54:34,383 - voice_bridge - INFO - bridge log file -> /app/logs/bridge.log
+2026-10-20 08:54:34,502 - voice_bridge - INFO - DH worker started
+2026-10-20 08:54:34,503 - voice_bridge - INFO - DH worker started (DUIX http://duix-avatar-gen-video:8383, container=duix-avatar-gen-video, temp=/duix_data/face2face/temp, avatar=my_avatar.mp4, max_keep=200)
+2026-10-20 08:54:36,350 - voice_bridge - INFO - DH container starting (duix-avatar-gen-video)…
+2026-10-20 08:55:09,415 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=probe "HTTP/1.0 200 OK"
+2026-10-20 08:55:09,416 - voice_bridge - INFO - DH container ready at http://duix-avatar-gen-video:8383
+2026-10-20 08:55:09,423 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=probe "HTTP/1.0 200 OK"
+2026-10-20 08:55:09,424 - voice_bridge - INFO - DH warmup: synthesizing warmup audio…
+2026-10-20 08:55:10,135 - httpx - INFO - HTTP Request: POST http://192.168.2.218:8300/v1/tts/zero_shot "HTTP/1.1 200 OK"
+2026-10-20 08:55:10,148 - voice_bridge - INFO - CosyVoice OK: voice_id=f1f26d18-7f51-4575-be6a-1e895027a5d3 chars=9 bytes=226640
+2026-10-20 08:55:11,068 - voice_bridge - INFO - DH synth: 2.36s audio -> 20261020085511061.wav
+2026-10-20 08:55:11,184 - httpx - INFO - HTTP Request: POST http://duix-avatar-gen-video:8383/easy/submit "HTTP/1.0 200 OK"
+2026-10-20 08:55:13,188 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:15,192 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:17,200 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:19,204 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:21,210 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:23,214 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:25,218 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:27,222 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:29,225 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:31,231 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:33,234 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:35,239 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:37,241 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:39,245 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:41,248 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:43,253 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:45,256 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:47,260 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:49,265 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:51,269 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:53,273 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:55,277 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:57,282 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:55:59,287 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:56:01,293 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:56:03,297 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:56:05,302 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:56:07,306 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:56:09,310 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52 "HTTP/1.0 200 OK"
+2026-10-20 08:56:09,317 - voice_bridge - INFO - DH warmup: done (prewarmed TTS/wenet/DUIX) warmup-72fe1f6b-667c-4907-aee9-b7705d9d0c52-r.mp4 cleaned
+2026-10-20 08:58:03,131 - voice_bridge - INFO - DH enqueue: 6d953b4e-a5fe-4694-ba92-0f249e1ce9e2 (16 chars), pending=1
+2026-10-20 08:58:04,473 - httpx - INFO - HTTP Request: POST http://192.168.2.218:8300/v1/tts/zero_shot "HTTP/1.1 200 OK"
+2026-10-20 08:58:04,492 - voice_bridge - INFO - CosyVoice OK: voice_id=f1f26d18-7f51-4575-be6a-1e895027a5d3 chars=16 bytes=330320
+2026-10-20 08:58:04,496 - voice_bridge - INFO - DH synth: 3.44s audio -> 20261020085804494.wav
+2026-10-20 08:58:04,550 - httpx - INFO - HTTP Request: POST http://duix-avatar-gen-video:8383/easy/submit "HTTP/1.0 200 OK"
+2026-10-20 08:58:06,553 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=6d953b4e-a5fe-4694-ba92-0f249e1ce9e2-s0 "HTTP/1.0 200 OK"
+2026-10-20 08:58:08,558 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=6d953b4e-a5fe-4694-ba92-0f249e1ce9e2-s0 "HTTP/1.0 200 OK"
+2026-10-20 08:58:10,562 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=6d953b4e-a5fe-4694-ba92-0f249e1ce9e2-s0 "HTTP/1.0 200 OK"
+2026-10-20 08:58:12,565 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=6d953b4e-a5fe-4694-ba92-0f249e1ce9e2-s0 "HTTP/1.0 200 OK"
+2026-10-20 08:58:12,579 - voice_bridge - INFO - DH 6d953b4e-a5fe-4694-ba92-0f249e1ce9e2-s0: segment done -> 6d953b4e-a5fe-4694-ba92-0f249e1ce9e2-s0-r.mp4
+2026-10-20 08:58:12,586 - voice_bridge - INFO - DH 6d953b4e-a5fe-4694-ba92-0f249e1ce9e2: done, 1 segment(s): ['6d953b4e-a5fe-4694-ba92-0f249e1ce9e2-s0-r.mp4']
+2026-10-20 09:01:12,730 - voice_bridge - INFO - avatar switched to smile_avatar.mp4
+2026-10-20 09:02:08,799 - voice_bridge - INFO - DH enqueue: 300a375e-e5a5-4287-8009-c2b987d0401e (16 chars), pending=1
+2026-10-20 09:02:10,515 - httpx - INFO - HTTP Request: POST http://192.168.2.218:8300/v1/tts/zero_shot "HTTP/1.1 200 OK"
+2026-10-20 09:02:10,527 - voice_bridge - INFO - CosyVoice OK: voice_id=f1f26d18-7f51-4575-be6a-1e895027a5d3 chars=16 bytes=326480
+2026-10-20 09:02:10,532 - voice_bridge - INFO - DH synth: 3.40s audio -> 20261020090210530.wav
+2026-10-20 09:02:10,598 - httpx - INFO - HTTP Request: POST http://duix-avatar-gen-video:8383/easy/submit "HTTP/1.0 200 OK"
+2026-10-20 09:02:12,602 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=300a375e-e5a5-4287-8009-c2b987d0401e-s0 "HTTP/1.0 200 OK"
+2026-10-20 09:02:14,608 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=300a375e-e5a5-4287-8009-c2b987d0401e-s0 "HTTP/1.0 200 OK"
+2026-10-20 09:02:16,613 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=300a375e-e5a5-4287-8009-c2b987d0401e-s0 "HTTP/1.0 200 OK"
+2026-10-20 09:02:18,617 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=300a375e-e5a5-4287-8009-c2b987d0401e-s0 "HTTP/1.0 200 OK"
+2026-10-20 09:02:20,621 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=300a375e-e5a5-4287-8009-c2b987d0401e-s0 "HTTP/1.0 200 OK"
+2026-10-20 09:02:20,630 - voice_bridge - INFO - DH 300a375e-e5a5-4287-8009-c2b987d0401e-s0: segment done -> 300a375e-e5a5-4287-8009-c2b987d0401e-s0-r.mp4
+2026-10-20 09:02:20,638 - voice_bridge - INFO - DH 300a375e-e5a5-4287-8009-c2b987d0401e: done, 1 segment(s): ['300a375e-e5a5-4287-8009-c2b987d0401e-s0-r.mp4']
+2026-10-20 09:08:40,756 - voice_bridge - INFO - bridge log file -> /app/logs/bridge.log
+2026-10-20 09:08:41,480 - voice_bridge - INFO - DH worker started
+2026-10-20 09:08:41,480 - voice_bridge - INFO - DH worker started (DUIX http://duix-avatar-gen-video:8383, container=duix-avatar-gen-video, temp=/duix_data/face2face/temp, avatar=my_avatar.mp4, max_keep=200)
+2026-10-20 09:08:41,880 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=probe "HTTP/1.0 200 OK"
+2026-10-20 09:08:41,887 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=probe "HTTP/1.0 200 OK"
+2026-10-20 09:08:41,889 - voice_bridge - INFO - DH warmup: synthesizing warmup audio…
+2026-10-20 09:08:42,575 - httpx - INFO - HTTP Request: POST http://192.168.2.218:8300/v1/tts/zero_shot "HTTP/1.1 200 OK"
+2026-10-20 09:08:42,594 - voice_bridge - INFO - CosyVoice OK: voice_id=f1f26d18-7f51-4575-be6a-1e895027a5d3 chars=9 bytes=234320
+2026-10-20 09:08:48,035 - voice_bridge - INFO - DH synth: 2.44s audio -> 20261020090848016.wav
+2026-10-20 09:08:48,137 - httpx - INFO - HTTP Request: POST http://duix-avatar-gen-video:8383/easy/submit "HTTP/1.0 200 OK"
+2026-10-20 09:08:50,143 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-7d88a702-1cfe-47b3-a5fa-6d594205a577 "HTTP/1.0 200 OK"
+2026-10-20 09:08:52,148 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-7d88a702-1cfe-47b3-a5fa-6d594205a577 "HTTP/1.0 200 OK"
+2026-10-20 09:08:54,153 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-7d88a702-1cfe-47b3-a5fa-6d594205a577 "HTTP/1.0 200 OK"
+2026-10-20 09:08:56,158 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-7d88a702-1cfe-47b3-a5fa-6d594205a577 "HTTP/1.0 200 OK"
+2026-10-20 09:08:58,162 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-7d88a702-1cfe-47b3-a5fa-6d594205a577 "HTTP/1.0 200 OK"
+2026-10-20 09:09:00,166 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-7d88a702-1cfe-47b3-a5fa-6d594205a577 "HTTP/1.0 200 OK"
+2026-10-20 09:09:02,173 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-7d88a702-1cfe-47b3-a5fa-6d594205a577 "HTTP/1.0 200 OK"
+2026-10-20 09:09:02,181 - voice_bridge - INFO - DH warmup: done (prewarmed TTS/wenet/DUIX) warmup-7d88a702-1cfe-47b3-a5fa-6d594205a577-r.mp4 cleaned
+2026-10-20 09:26:18,502 - voice_bridge - INFO - bridge log file -> /app/logs/bridge.log
+2026-10-20 09:26:19,339 - voice_bridge - INFO - DH worker started
+2026-10-20 09:26:19,341 - voice_bridge - INFO - DH worker started (DUIX http://duix-avatar-gen-video:8383, container=duix-avatar-gen-video, temp=/duix_data/face2face/temp, avatar=my_avatar.mp4, max_keep=200)
+2026-10-20 09:26:19,630 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=probe "HTTP/1.0 200 OK"
+2026-10-20 09:26:19,636 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=probe "HTTP/1.0 200 OK"
+2026-10-20 09:26:19,637 - voice_bridge - INFO - DH warmup: synthesizing warmup audio…
+2026-10-20 09:26:20,468 - httpx - INFO - HTTP Request: POST http://192.168.2.218:8300/v1/tts/zero_shot "HTTP/1.1 200 OK"
+2026-10-20 09:26:20,486 - voice_bridge - INFO - CosyVoice OK: voice_id=f1f26d18-7f51-4575-be6a-1e895027a5d3 chars=9 bytes=288080
+2026-10-20 09:26:27,697 - voice_bridge - INFO - DH synth: 3.00s audio -> 20261020092627669.wav
+2026-10-20 09:26:27,767 - httpx - INFO - HTTP Request: POST http://duix-avatar-gen-video:8383/easy/submit "HTTP/1.0 200 OK"
+2026-10-20 09:26:29,772 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-354a903c-14ba-4e02-ab4a-85d6dba0613e "HTTP/1.0 200 OK"
+2026-10-20 09:26:31,775 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-354a903c-14ba-4e02-ab4a-85d6dba0613e "HTTP/1.0 200 OK"
+2026-10-20 09:26:33,779 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-354a903c-14ba-4e02-ab4a-85d6dba0613e "HTTP/1.0 200 OK"
+2026-10-20 09:26:35,782 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-354a903c-14ba-4e02-ab4a-85d6dba0613e "HTTP/1.0 200 OK"
+2026-10-20 09:26:37,787 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-354a903c-14ba-4e02-ab4a-85d6dba0613e "HTTP/1.0 200 OK"
+2026-10-20 09:26:39,791 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-354a903c-14ba-4e02-ab4a-85d6dba0613e "HTTP/1.0 200 OK"
+2026-10-20 09:26:41,796 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-354a903c-14ba-4e02-ab4a-85d6dba0613e "HTTP/1.0 200 OK"
+2026-10-20 09:26:43,799 - httpx - INFO - HTTP Request: GET http://duix-avatar-gen-video:8383/easy/query?code=warmup-354a903c-14ba-4e02-ab4a-85d6dba0613e "HTTP/1.0 200 OK"
+2026-10-20 09:26:43,805 - voice_bridge - INFO - DH warmup: done (prewarmed TTS/wenet/DUIX) warmup-354a903c-14ba-4e02-ab4a-85d6dba0613e-r.mp4 cleaned

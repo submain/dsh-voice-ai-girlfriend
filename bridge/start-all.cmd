@@ -62,7 +62,8 @@ cd /d "%DSH_HARNESS%"
 rem Skip if 3080 is already serving (e.g. a manual pnpm dsh web is running)
 >nul 2>&1 curl -s -m 2 "http://127.0.0.1:3080" && goto :web_up
 rem start in its OWN window so closing this launcher never kills dsh web
-start "dsh-web" /min cmd /c "cd /d ""%DSH_HARNESS%"" && set OPENAI_BASE_URL=https://apihub.agnes-ai.com/v1 && set OPENAI_API_KEY= && pnpm dsh web"
+rem LLM 上游：Qwen3.8-27B（远端 vLLM，OpenAI 兼容；原 apihub.agnes-ai.com 已弃用）
+start "dsh-web" /min cmd /c "cd /d ""%DSH_HARNESS%"" && set OPENAI_BASE_URL=http://192.168.2.218:11435/v1 && set OPENAI_API_KEY=EMPTY && pnpm dsh web"
 :web_up
 echo Waiting for DSH Web :3080 ...
 for /l %%i in (1,1,60) do (

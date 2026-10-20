@@ -152,10 +152,14 @@ class ModelManager:
 
 def _load_stt_handler():
     """Instantiate the configured STT backend: 'funasr' (Chinese ASR, default
-    when configured) or the original WhisperSTTHandler fallback."""
+    when configured), 'http' (remote sh_asr_service, no local model) or the
+    original WhisperSTTHandler fallback."""
     backend = CONFIG["stt"].get("backend", "whisper")
     if backend == "funasr":
         return _load_funasr_handler()
+    if backend == "http":
+        # 哨兵值：不加载本地模型，转写走 _transcribe_http（远程 HTTP ASR）
+        return True
 
     from queue import Empty, Queue
     from threading import Event
@@ -238,7 +242,10 @@ def decode_audio(body: bytes, content_type: str) -> np.ndarray:
 
 
 def _transcribe(handler, audio: np.ndarray) -> tuple[str, str | None]:
-    if CONFIG["stt"].get("backend", "whisper") == "funasr":
+    backend = CONFIG["stt"].get("backend", "whisper")
+    if backend == "http":
+        return _transcribe_http(audio)
+    if backend == "funasr":
         return _transcribe_funasr(handler, audio)
 
     from speech_to_speech.pipeline.messages import VADAudio
@@ -253,6 +260,39 @@ def _transcribe(handler, audio: np.ndarray) -> tuple[str, str | None]:
         logger.warning("STT: whisper returned a degenerate (1-token) generation; treating as empty")
         return "", None
     return transcription.text, transcription.language_code
+
+
+def _transcribe_http(audio: np.ndarray) -> tuple[str, str | None]:
+    """远程 HTTP ASR（本机 sh_asr_service，POST /asr multipart wav → {"text"}）。
+
+    本机不加载任何 ASR 模型；16kHz float32 先包成 wav 再上传，服务端
+    自动按需转换/识别。配置：stt.http_base（默认 host.docker.internal:9090）。
+    """
+    base = str(CONFIG["stt"].get("http_base", "http://host.docker.internal:9090")).rstrip("/")
+    timeout = float(CONFIG["stt"].get("http_timeout_sec", 30))
+    buf = io.BytesIO()
+    import wave as _wave
+
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes((np.clip(audio, -1.0, 1.0) * 32767).astype("<i2").tobytes())
+    try:
+        resp = httpx.post(
+            f"{base}/asr",
+            files={"file": ("audio.wav", buf.getvalue(), "audio/wav")},
+            data={"language": "中文", "itn": "true"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        text = str((resp.json() or {}).get("text") or "").strip()
+        if not text:
+            logger.warning("STT: http ASR (%s) returned empty result", base)
+        return text, "zh"
+    except Exception:  # noqa: BLE001 - surfaced to the client
+        logger.exception("STT: http ASR failed (%s)", base)
+        return "", None
 
 
 def _transcribe_funasr(model, audio: np.ndarray) -> tuple[str, str | None]:
@@ -355,15 +395,18 @@ def _synthesize(handler, text: str, cancel: threading.Event | None = None) -> np
     """Run TTS for one utterance, concatenating int16 chunks.
 
     Stops early between chunks when `cancel` is set (client disconnect).
-    当前音色是 OmniVoice（design/clone）时改走 OmniVoice 引擎；
-    其余走 Qwen3 handler（参考音色克隆）。
+    当前音色是 CosyVoice（远端 HTTP）时走远端合成；OmniVoice（design/clone）
+    走 OmniVoice 引擎；其余走 Qwen3 handler（参考音色克隆）。
     """
-    from speech_to_speech.pipeline.messages import TTSInput
-
     persona = PERSONAS.get(_current_persona, {})
+    if persona.get("engine", "qwen3") == "cosyvoice":
+        # CosyVoice（远端 HTTP）：原子调用，无法中途取消，完成后由调用方检查 cancel
+        return _synthesize_cosyvoice(text, persona)
     if persona.get("engine", "qwen3") != "qwen3":
         # OmniVoice 无法中途取消：合成为原子调用，完成后由调用方检查 cancel
         return _synthesize_omnivoice(text, persona)
+
+    from speech_to_speech.pipeline.messages import TTSInput
 
     chunks = []
     for chunk in handler.process(TTSInput(text=text, language_code="zh")):
@@ -405,6 +448,16 @@ OMNI_BASE = str(OMNI_CFG.get("base", "")).rstrip("/")
 OMNI_LANG = OMNI_CFG.get("lang", "Chinese")
 OMNI_TIMEOUT = float(OMNI_CFG.get("timeout_sec", 120))
 
+# ── CosyVoice TTS 引擎（第三 TTS 后端，远端 HTTP，零本地显存）────────────────
+# 服务：H100 上的 CosyVoice（参考 SoulX-FlashHead-Supmain 方案），
+# 零样本合成接口 POST {base}/v1/tts/zero_shot（form: tts_text, voice_id）→ wav。
+# 音色：voices 下放 cosyvoice.json（{"voice_id": "...", "label": "..."}）即可
+# 注册为该引擎音色；不带 voice_id 的 persona 回退 cosyvoice.voice_id（默认 default）。
+COSY_CFG = CONFIG.get("cosyvoice", {})
+COSY_BASE = str(COSY_CFG.get("base", "")).rstrip("/")
+COSY_VOICE_ID = str(COSY_CFG.get("voice_id", "") or "default")
+COSY_TIMEOUT = float(COSY_CFG.get("timeout_sec", 60))
+
 _omni_lock = threading.Lock()
 _omni_client = None  # 惰性单例 gradio Client
 
@@ -422,19 +475,24 @@ def _omni_default(param: str, fallback):
     return OMNI_CFG.get(param, fallback)
 
 
-def _load_wav_16k(path: str) -> np.ndarray:
-    """读 wav（任意采样率）→ 16kHz 单声道 int16 samples。"""
+def _wav_bytes_to_16k(data: bytes) -> np.ndarray:
+    """wav 字节（任意采样率/声道）→ 16kHz 单声道 int16 samples。"""
     import soundfile as sf
     from scipy.signal import resample_poly
 
-    data, sr = sf.read(path, dtype="float32", always_2d=False)
-    if data.ndim > 1:
-        data = data.mean(axis=1)
+    data_arr, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=False)
+    if data_arr.ndim > 1:
+        data_arr = data_arr.mean(axis=1)
     if sr != 16000:
         import math
         g = math.gcd(int(sr), 16000)
-        data = resample_poly(data, 16000 // g, int(sr) // g)
-    return (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
+        data_arr = resample_poly(data_arr, 16000 // g, int(sr) // g)
+    return (np.clip(data_arr, -1.0, 1.0) * 32767).astype(np.int16)
+
+
+def _load_wav_16k(path: str) -> np.ndarray:
+    """读 wav 文件（任意采样率）→ 16kHz 单声道 int16 samples。"""
+    return _wav_bytes_to_16k(Path(path).read_bytes())
 
 
 def _synthesize_omnivoice(text: str, persona: dict) -> np.ndarray:
@@ -486,6 +544,32 @@ def _synthesize_omnivoice(text: str, persona: dict) -> np.ndarray:
     wav_path, status = result[0], result[1]
     logger.info("OmniVoice %s OK: status=%r chars=%d", engine, status, len(text))
     return _load_wav_16k(wav_path)
+
+
+def _synthesize_cosyvoice(text: str, persona: dict) -> np.ndarray:
+    """用远端 CosyVoice 合成一段文本，返回 16kHz int16 samples。
+
+    persona: PERSONAS[name]（engine=cosyvoice，可带 voice_id）。
+    服务不可达/合成失败抛 RuntimeError，由调用方决定如何收尾。
+    与 OmniVoice 一样为原子调用（无法中途取消），完成后由调用方检查 cancel。
+    """
+    if not COSY_BASE:
+        raise RuntimeError("CosyVoice 未配置：bridge-config.json 缺 cosyvoice.base")
+    voice_id = str(persona.get("voice_id") or COSY_VOICE_ID or "default")
+    try:
+        resp = httpx.post(
+            f"{COSY_BASE}/v1/tts/zero_shot",
+            data={"tts_text": text, "voice_id": voice_id},
+            timeout=COSY_TIMEOUT,
+        )
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("CosyVoice failed for %r (voice_id=%s)", text[:40], voice_id)
+        raise RuntimeError(f"CosyVoice 合成失败: {type(exc).__name__}: {exc}") from exc
+    if not resp.content:
+        raise RuntimeError("CosyVoice 返回空音频")
+    logger.info("CosyVoice OK: voice_id=%s chars=%d bytes=%d", voice_id, len(text), len(resp.content))
+    return _wav_bytes_to_16k(resp.content)
 
 
 # ── Companion media hosting (T8) ────────────────────────────────────────────
@@ -686,13 +770,16 @@ def _docker(args: list[str], timeout: float = 120.0) -> tuple[bool, str]:
 
 # ── TTS 音色预设（统一从 voices 大文件夹下子文件夹读取）────────────────────
 # 约定：VOICES_DIR（voices）下的每个【子文件夹】= 一个音色，文件夹名即音色名。
-# 三种音色类型（按文件夹内容自动识别，engine 字段区分）：
+# 四种音色类型（按文件夹内容自动识别，engine 字段区分）：
 #   1. qwen3 克隆音色（默认）：ref_audio.wav + ref_text.txt —— Qwen3-TTS 克隆
 #   2. omni-design 音色：design.json（无需音频）—— OmniVoice 参数设计音色
 #   3. omni-clone 音色：ref_audio + ref_text.txt + omnivoice.txt（空标记）——
 #      OmniVoice 引擎克隆参考音频（比 Qwen3 克隆更保真）
+#   4. cosyvoice 音色：cosyvoice.json（{"voice_id": "...", "label": "..."}）——
+#      远端 CosyVoice 已注册音色（服务端内存态，参考 SoulX-FlashHead 方案）
 # 新增音色：在 voices 下新建子文件夹放对应文件即可，启动时自动扫描。
-VOICES_DIR = Path("D:/speech-to-speech/voices")
+# 目录可用 persona.voices_dir 配置（Docker 挂载时指向容器内路径）。
+VOICES_DIR = Path((CONFIG.get("persona") or {}).get("voices_dir", "D:/speech-to-speech/voices"))
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
 TEXT_EXTS = {".txt", ".text"}
 
@@ -730,6 +817,18 @@ def _scan_voices() -> dict[str, dict]:
                     "engine": "omni-clone",
                     "ref_audio": str(audio),
                     "ref_text": ref_text,
+                }
+            elif (entry / "cosyvoice.json").is_file():
+                # CosyVoice 远端音色：cosyvoice.json {"voice_id": "...", "label": "..."}
+                try:
+                    cosy = json.loads((entry / "cosyvoice.json").read_text(encoding="utf-8-sig"))
+                except Exception:  # noqa: BLE001
+                    logger.exception("voice %s: bad cosyvoice.json, skipped", name)
+                    continue
+                voices[name] = {
+                    "label": str(cosy.get("label", name)),
+                    "engine": "cosyvoice",
+                    "voice_id": str(cosy.get("voice_id", "")),
                 }
             elif audio is not None:
                 # Qwen3 克隆音色（默认引擎）
@@ -1089,15 +1188,22 @@ def _split_segments(text: str, max_len: int = 48) -> list[str]:
 
 def _synthesize_full(handler, text: str) -> np.ndarray:
     """整段回复 TTS：超长文本分块合成后拼接为一条连续 int16 音频。"""
-    from speech_to_speech.pipeline.messages import TTSInput
-
     persona = PERSONAS.get(_current_persona, {})
+    if persona.get("engine", "qwen3") == "cosyvoice":
+        # CosyVoice（远端 HTTP）：同样分块，每块一次合成调用，再拼接
+        chunks = [_synthesize_cosyvoice(part, persona) for part in _split_segments(text, 400)]
+        if not chunks:
+            raise RuntimeError("DH TTS produced no audio")
+        return np.concatenate(chunks)
+
     if persona.get("engine", "qwen3") != "qwen3":
         # OmniVoice：同样分块（每块一次合成调用），再拼接
         chunks = [_synthesize_omnivoice(part, persona) for part in _split_segments(text, 400)]
         if not chunks:
             raise RuntimeError("DH TTS produced no audio")
         return np.concatenate(chunks)
+
+    from speech_to_speech.pipeline.messages import TTSInput
 
     chunks: list[np.ndarray] = []
     for part in _split_segments(text, 400):

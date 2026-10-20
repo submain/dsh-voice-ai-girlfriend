@@ -74,9 +74,15 @@
     "po": true,
     "timeout_sec": 120
   },
+  "cosyvoice": {
+    "base": "http://192.168.2.218:8300",
+    "voice_id": "default",
+    "timeout_sec": 60
+  },
   "persona": {
     "default_voice": "<voices 下的音色文件夹名>",
     "default_avatar": "my_avatar.mp4",
-    "default_idle": "default"
+    "default_idle": "default",
+    "voices_dir": "D:/speech-to-speech/voices"
   }
 }
