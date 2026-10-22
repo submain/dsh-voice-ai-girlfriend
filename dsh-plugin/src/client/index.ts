@@ -114,6 +114,30 @@ export function apply(ctx: ClientContext): void {
     _registerInterruptHandler: (handler: (() => void) | null) => {
       interruptHandler = handler
     },
+    setThinking: async (enabled: boolean) => {
+      if (sessionId === undefined) throw new Error('[ui-voice] no session scope for setThinking')
+      const session = ctx.sessions.binding(sessionId)?.session
+      if (session === undefined) throw new Error('[ui-voice] session unavailable for setThinking')
+      // 思考档位挂在「模型路由」上，切档必须连 provider/model 一起重新提交。
+      // 当前生效的选择：Session 投影里还没被消费的 next 优先，其次 lastUsed，
+      // 都没有就退回部署默认（settings.yaml 的 agent-default-model）。
+      const projection = (session.getSnapshot() as
+        | { modelSelection?: { next?: unknown; lastUsed?: unknown } }
+        | undefined)?.modelSelection
+      const projected = (projection?.next ?? projection?.lastUsed) as
+        | { provider: string; model: string }
+        | undefined
+      const target = projected ?? (await ctx.sessions.modelCatalog()).default
+      const result = await ctx.sessions.selectModel({
+        sessionId,
+        provider: target.provider,
+        model: target.model,
+        reasoningEffort: enabled ? 'medium' : 'off',
+      })
+      if (!result.ok) {
+        throw new Error(`[ui-voice] setThinking failed: ${result.error.code}: ${result.error.message}`)
+      }
+    },
   })
 
   // ── composer tool controls live ABOVE the input card (conversation.input.dock):

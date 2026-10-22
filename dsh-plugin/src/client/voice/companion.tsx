@@ -26,7 +26,7 @@ import type { CSSProperties } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: pulls ui-conversation's SlotMap merge for PropsRuntime resolution.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { bridgeBase, dhStatus, dhDiscard, tts, readVoiceEnabled, type DhStatus } from '../bridge.ts'
+import { bridgeBase, dhStatus, dhDiscard, onDhWarmup, tts, readVoiceEnabled, type DhStatus, type DhWarmup } from '../bridge.ts'
 import { readDigitalHuman } from '../DigitalHumanToggle.tsx'
 import type { VoiceInjected } from '../contract.ts'
 import css from './CompanionWindow.module.css'
@@ -143,7 +143,10 @@ const VIDEO_STYLE: CSSProperties = {
   opacity: 0,
 }
 
-/** 卡片左下角的分段进度浮层（分段 TTS 是逐段提交给 DUIX 的）。 */
+/** The filler <audio> is audio-only: keep it out of the layout entirely. */
+const WARMUP_AUDIO_STYLE: CSSProperties = { display: 'none' }
+
+/** 卡片左下角的异常提示浮层（只在生成失败/取消时出现）。 */
 const DH_SEG_STYLE: CSSProperties = {
   position: 'absolute',
   left: 12,
@@ -164,22 +167,6 @@ const DH_SEG_STYLE: CSSProperties = {
   pointerEvents: 'none',
   zIndex: 6,
   backdropFilter: 'blur(6px)',
-}
-
-const DH_SEG_BAR_STYLE: CSSProperties = {
-  display: 'block',
-  height: 3,
-  borderRadius: 999,
-  background: 'rgba(255,255,255,0.18)',
-  overflow: 'hidden',
-}
-
-const DH_SEG_FILL_STYLE: CSSProperties = {
-  display: 'block',
-  height: '100%',
-  borderRadius: 999,
-  background: 'rgba(255,255,255,0.88)',
-  transition: 'width 0.4s ease',
 }
 
 /** 语音总开关关着时的提示（整条回复管道的总闸，数字人也跟着不提交）。 */
@@ -203,26 +190,13 @@ const DH_HINT_STYLE: CSSProperties = {
 }
 
 /**
- * 数字人分段进度一行文案：分段 TTS 逐段提交给 DUIX（段 N 生成时预合成段 N+1），
- * 所以桥接能给出确切的总段数/已完成段数——一眼看出还差几段，而不是干等。
+ * 数字人异常时的一行提示。正常生成/播放期间不再显示任何文字（原先的
+ * 「数字人 · 第 N/M 段 生成中」这类分段进度已按需求去掉，窗口只留画面）。
  */
 function dhSegText(dh: DhStatus): string {
-  const total = dh.total_segments || 0
-  const done = dh.done_segments || 0
-  if (dh.state === 'done') {
-    const n = total || done
-    return `数字人 · ${n}/${n} 段 已完成`
-  }
   if (dh.state === 'error') return `数字人 · 失败：${dh.message || '生成出错'}`
   if (dh.state === 'discarded') return '数字人 · 已取消'
-  if (total > 0) {
-    const current = Math.min(done + 1, total)
-    const phase = dh.state === 'tts' ? ' 语音合成' : dh.state === 'generating' ? ' 生成中' : ''
-    const extra = dh.pending > 0 ? `（排队 ${dh.pending}）` : ''
-    return `数字人 · 第 ${current}/${total} 段${phase}${extra}`
-  }
-  if (dh.duix?.state === 'starting') return '数字人 · DUIX 容器启动中…'
-  return dh.message || '数字人生成中…'
+  return ''
 }
 
 /**
@@ -271,6 +245,20 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
   const dhQueueRef = useRef<string[]>([])
   const dhQueueCodeRef = useRef('')
   const dhQueuePlayedRef = useRef(0)
+  // 桥接仍在分段生成（还有后续段没到）→ 播放端播空时「停在最后一帧」，
+  // 而不是掉回待机动画（首段为了尽快出帧被切短，生成端追不上时就会播空）。
+  const dhPendingRef = useRef(false)
+  const dhHoldingRef = useRef(false)
+
+  // Filler ("暖场") audio: pre-synthesized "嗯…" clips in the current voice.
+  // open = the instant a reply is accepted (first frame is ~10s+ away);
+  // mid  = when the segment queue runs dry while more is still rendering.
+  const warmVidRef = useRef<HTMLVideoElement | null>(null)
+  const warmRef = useRef<HTMLAudioElement | null>(null)
+  const warmupRef = useRef<DhWarmup | null>(null)
+  const warmMidCountRef = useRef(0)
+  const warmMidAtRef = useRef(0)
+  const warmLastOpenRef = useRef(0)
 
   // Drag-move state.
   const moveRef = useRef<{ startX: number; startY: number; base: { x: number; y: number } } | null>(null)
@@ -527,15 +515,91 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
     }
   }, [])
 
+  /** Silence both filler layers (a real segment is taking over, or we stop). */
+  const stopWarmup = useCallback(() => {
+    const clip = warmVidRef.current
+    if (clip !== null) {
+      clip.pause()
+      clip.currentTime = 0
+      clip.style.opacity = '0'
+    }
+    const audio = warmRef.current
+    if (audio !== null) {
+      audio.pause()
+      audio.currentTime = 0
+    }
+  }, [])
+
   const stopDh = useCallback(() => {
+    dhHoldingRef.current = false
     const vid = dhRef.current
     if (vid !== null) {
       vid.pause()
       vid.currentTime = 0
       vid.style.opacity = '0'
     }
+    stopWarmup()
     setDhPlayingBoth(false)
-  }, [setDhPlayingBoth])
+  }, [setDhPlayingBoth, stopWarmup])
+
+  /** Play one filler line (random pick). False when nothing is available.
+   *  Prefers the lip-synced clip (she actually talks); falls back to audio-only
+   *  until the bridge finishes rendering the clip. */
+  const playWarmup = useCallback((kind: 'open' | 'mid'): boolean => {
+    if (!readDigitalHuman()) return false
+    const list = kind === 'open' ? warmupRef.current?.open : warmupRef.current?.mid
+    if (list === undefined || list.length === 0) return false
+    const item = list[Math.floor(Math.random() * list.length)]
+    if (item === undefined) return false
+    const base = bridgeBase()
+    const clip = warmVidRef.current
+    if (item.video !== null && clip !== null) {
+      clip.src = `${base}${item.video}`
+      clip.style.opacity = '1'
+      void clip.play().catch(() => {})
+      return true
+    }
+    const audio = warmRef.current
+    if (audio === null) return false
+    audio.src = `${base}${item.audio}`
+    void audio.play().catch(() => {})
+    return true
+  }, [])
+
+  // A reply was accepted by the bridge: speak up IMMEDIATELY. The first video
+  // segment is ten-plus seconds away, and total silence reads as "disconnected".
+  // Any leftover segment from the previous reply is cut first so the two audio
+  // tracks never overlap.
+  useEffect(() => {
+    return onDhWarmup((warmup) => {
+      warmupRef.current = warmup
+      warmMidCountRef.current = 0
+      warmMidAtRef.current = 0
+      // 受理即视为「还在生成」：状态轮询要 4s 才跟上，暖场续接不能等它
+      dhPendingRef.current = true
+      if (!readDigitalHuman()) return
+      stopDh()
+      // 一个用户回合可能提交两次（先 first 段、4s 后再 last 段）。第二次
+      // 不该再「嗯，我看看啊」一次——同一回合里开场暖场只出声一遍。
+      const now = Date.now()
+      if (now - warmLastOpenRef.current > 8000) {
+        warmLastOpenRef.current = now
+        playWarmup('open')
+      }
+    })
+  }, [playWarmup, stopDh])
+
+  /** Queue ran dry mid-reply: fill the gap with one filler line (rate-limited). */
+  const maybeMidWarmup = useCallback((): boolean => {
+    const max = warmupRef.current?.max_mid ?? 3
+    if (warmMidCountRef.current >= max) return false
+    const now = Date.now()
+    if (now - warmMidAtRef.current < 1500) return false
+    if (!playWarmup('mid')) return false
+    warmMidCountRef.current += 1
+    warmMidAtRef.current = now
+    return true
+  }, [playWarmup])
 
   // 用户占用麦克风/说话（interruptReply）：停止数字人视频播放。
   useEffect(() => {
@@ -557,11 +621,13 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       setDhPlayingBoth(false)
       return
     }
+    // 正片到了：暖场必须立刻闭嘴（它是占位用的，绝不能盖住真实语音）
+    stopWarmup()
     vid.style.opacity = '1'
     vid.src = next
     void vid.play().catch(() => {})
     setDhPlayingBoth(true)
-  }, [setDhPlayingBoth])
+  }, [setDhPlayingBoth, stopWarmup])
 
   const driveDh = (status: DhStatus): void => {
     const code = status.code
@@ -579,9 +645,12 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       stopDh()
     }
     if (handledDhRef.current.has(code)) return
+    // 桥接是否还在往下出段（决定播空时是停帧等，还是收尾回待机）
+    dhPendingRef.current = status.state === 'tts' || status.state === 'generating'
     if (status.state === 'discarded') {
       handledDhRef.current.add(code)
       waitingDhRef.current = null
+      dhPendingRef.current = false
       dhQueueRef.current = []
       stopDh()
       return
@@ -589,6 +658,7 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
     if (status.state === 'error' && status.pending === 0) {
       handledDhRef.current.add(code)
       waitingDhRef.current = null
+      dhPendingRef.current = false
       dhQueueRef.current = []
       stopDh()
       if (status.text) {
@@ -606,6 +676,7 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       } else if (now - waitingDhRef.current.at > timeoutMs) {
         handledDhRef.current.add(code)
         waitingDhRef.current = null
+        dhPendingRef.current = false
         dhQueueRef.current = []
         dhDiscard(code)
         stopDh()
@@ -627,7 +698,17 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
         handledDhRef.current.add(code)
         waitingDhRef.current = null
       }
-      if (!dhPlayingRef.current && dhQueuePlayedRef.current < dhQueueRef.current.length) {
+      if (dhHoldingRef.current) {
+        // 停帧等待中：新段一到就续播（停帧期间 dhPlaying 仍为 true，
+        // 不能走下面的「未在播放」分支，否则永远醒不过来）
+        if (dhQueuePlayedRef.current < dhQueueRef.current.length) {
+          dhHoldingRef.current = false
+          playNextDh()
+        } else if (status.state === 'done') {
+          dhHoldingRef.current = false
+          stopDh()  // 全部段都播完了：正常收尾
+        }
+      } else if (!dhPlayingRef.current && dhQueuePlayedRef.current < dhQueueRef.current.length) {
         playNextDh()
       }
     }
@@ -650,12 +731,32 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
     dhQueuePlayedRef.current += 1
     if (dhQueuePlayedRef.current < dhQueueRef.current.length) {
       playNextDh()
-    } else {
-      setDhPlayingBoth(false)
-      const vid = dhRef.current
-      if (vid !== null) vid.style.opacity = '0'
+      return
     }
-  }, [playNextDh, setDhPlayingBoth])
+    const vid = dhRef.current
+    if (dhPendingRef.current && vid !== null) {
+      // 还有后续段在生成：停在当前段最后一帧等它，别掉回待机动画。
+      // 同时补一句暖场语音——画面停住 + 有声音，才像「在想」而不是卡死。
+      dhHoldingRef.current = true
+      vid.pause()
+      maybeMidWarmup()
+      return
+    }
+    setDhPlayingBoth(false)
+    if (vid !== null) vid.style.opacity = '0'
+    stopWarmup()  // 整条回复播完：暖场那帧也收掉，回到待机动画
+  }, [playNextDh, setDhPlayingBoth, maybeMidWarmup, stopWarmup])
+
+  /** A filler line finished but we are still waiting: top it up (bounded). */
+  const onWarmEnded = useCallback(() => {
+    if (!dhPendingRef.current) return
+    window.setTimeout(() => {
+      if (!dhPendingRef.current) return
+      // ① 段间等待（画面停帧）或 ② 首段还没到（队列空、一段都没播过）
+      const waitingFirst = dhQueuePlayedRef.current === 0 && dhQueueRef.current.length === 0
+      if (dhHoldingRef.current || waitingFirst) maybeMidWarmup()
+    }, 2500)
+  }, [maybeMidWarmup])
 
   // ── Drag to reposition ────────────────────────────────────────────────────
   const beginMove = useCallback((clientX: number, clientY: number) => {
@@ -805,22 +906,17 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       <video ref={taskRef} style={VIDEO_STYLE} muted playsInline preload="metadata" draggable={false} onEnded={onTaskEnded} />
       {/* Digital-human frame (load on demand, carries the TTS audio) */}
       <video ref={dhRef} style={VIDEO_STYLE} playsInline preload="metadata" draggable={false} onEnded={onDhEnded} />
-      {/* 分段进度（左下角）：分段 TTS 逐段提交，显示「第 N/M 段」。
-          旧的 dhCaption（右下角，显示桥接 message）已删——信息重复会重叠。 */}
+      {/* Filler clip: pre-rendered lip-synced "嗯…" in the SAME avatar, so the
+          gap looks like her thinking instead of a frozen/idle background. */}
+      <video ref={warmVidRef} style={VIDEO_STYLE} playsInline preload="auto" draggable={false} onEnded={onWarmEnded} />
+      {/* Audio-only fallback while the clip above has not been rendered yet. */}
+      <audio ref={warmRef} preload="auto" onEnded={onWarmEnded} style={WARMUP_AUDIO_STYLE} />
+      {/* 只在失败/取消时给一行提示。生成中的「第 N/M 段」进度和进度条已移除，
+          数字人窗口只留画面，不叠加任何文字。 */}
       {readDigitalHuman() && dh !== null
-        && (dhBusy || dhPlaying || dh.state === 'error' || dh.state === 'discarded') && (
+        && (dh.state === 'error' || dh.state === 'discarded') && (
         <div style={DH_SEG_STYLE}>
-          <span style={{ fontVariantNumeric: 'tabular-nums' }}>{dhSegText(dh)}</span>
-          {dh.total_segments > 0 && (
-            <span style={DH_SEG_BAR_STYLE}>
-              <i
-                style={{
-                  ...DH_SEG_FILL_STYLE,
-                  width: `${Math.round((Math.min(dh.done_segments, dh.total_segments) / dh.total_segments) * 100)}%`,
-                }}
-              />
-            </span>
-          )}
+          <span>{dhSegText(dh)}</span>
         </div>
       )}
       {/* 语音总开关关着：整条管道都不提交，明确提示 */}

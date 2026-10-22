@@ -17,6 +17,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { VoiceInjected } from './contract.ts'
 import { MicButton } from './MicButton.tsx'
 import { VoiceToggle } from './VoiceToggle.tsx'
+import { ThinkingToggle } from './ThinkingToggle.tsx'
 import { DigitalHumanToggle } from './DigitalHumanToggle.tsx'
 import { QqPushToggle } from './QqPushToggle.tsx'
 import { CompanionToggle } from './CompanionToggle.tsx'
@@ -38,6 +39,7 @@ export const VoiceToolbar = memo(function VoiceToolbar(props: VoiceToolbarProps)
   // toolbar carries, so pass the whole props through with an explicit cast.
   const micProps = props as unknown as React.ComponentProps<typeof MicButton>
   const voiceProps = props as unknown as React.ComponentProps<typeof VoiceToggle>
+  const thinkingProps = props as unknown as React.ComponentProps<typeof ThinkingToggle>
   const dhProps = props as unknown as React.ComponentProps<typeof DigitalHumanToggle>
   const qqProps = props as unknown as React.ComponentProps<typeof QqPushToggle>
   const companionProps = props as unknown as React.ComponentProps<typeof CompanionToggle>
@@ -59,6 +61,7 @@ export const VoiceToolbar = memo(function VoiceToolbar(props: VoiceToolbarProps)
       <PersonaToggle {...personaProps} />
       <MicButton {...micProps} />
       <VoiceToggle {...voiceProps} />
+      <ThinkingToggle {...thinkingProps} />
       <DigitalHumanToggle {...dhProps} />
       <QqPushToggle {...qqProps} />
       <CompanionToggle {...companionProps} />

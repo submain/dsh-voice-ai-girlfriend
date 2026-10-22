@@ -43,4 +43,15 @@ export interface VoiceInjected {
    * invoked by `interruptReply()` to mark its current reply as interrupted.
    */
   _registerInterruptHandler: (handler: (() => void) | null) => void
+  /**
+   * 切换模型的思考模式。
+   *
+   * 关闭走 Session 级模型选择：`reasoningEffort: 'off'` 会让 provider 的
+   * `chatTemplateKwargs` 把 `enable_thinking` 置为 false（见 settings.yaml 的
+   * compat 段）。对 Qwen3 这类默认思考的模型，实测同一请求 1.2s → 0.1s，而且
+   * 不会再出现「思考过程直接写进正文、被 TTS 念出来」的问题。
+   * @param enabled - true 恢复思考（更缜密但更慢），false 关闭思考（首字更快）。
+   * @returns 切换完成后 resolve；无 session 或模型不支持档位时 reject。
+   */
+  setThinking: (enabled: boolean) => Promise<void>
 }

@@ -20,10 +20,13 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
 import os
+import re
+import shutil
 import subprocess
 import threading
 import time
@@ -705,6 +708,16 @@ def _persist_dh_enabled(enabled: bool) -> None:
 
 
 DH_DUIX_BASE = DH_CFG.get("duix_base", "http://127.0.0.1:8383").rstrip("/")
+# ── 多实例并行（2026-10-21）──────────────────────────────────────────────
+# 单实例同一时刻只能跑一个任务（busy 10001），而单任务只把 GPU 打到 ~70%、
+# 显存峰值 5.2/12.2GB，剩下算力全空着。起第二个实例后两段能同时渲染：
+# 实测 5.6s 音频 → 串行 10.1s+11.8s；并行 10.1s/12.2s（同时完成），
+# GPU 峰值 96%。所以分段生成改成 N 条 lane 并发，总等待接近减半。
+# 配置里给 duix_bases 列表即启用；缺省退化为单实例，行为与旧版一致。
+_raw_bases = DH_CFG.get("duix_bases") or [DH_DUIX_BASE]
+DH_DUIX_BASES: list[str] = [str(b).strip().rstrip("/") for b in _raw_bases if str(b).strip()]
+if not DH_DUIX_BASES:
+    DH_DUIX_BASES = [DH_DUIX_BASE]
 DH_DATA_DIR = Path(DH_CFG.get("data_dir", "D:/duix_avatar_data/face2face"))
 DH_TEMP_DIR = DH_DATA_DIR / DH_CFG.get("temp_dir", "temp")
 # 生成产物子目录：数字人成品视频（<uuid>-r.mp4）统一放这里，与 temp 根目录的
@@ -717,16 +730,73 @@ DH_SUBMIT_RETRY_SEC = float(DH_CFG.get("submit_retry_sec", 5))
 DH_SUBMIT_CONN_FAILS = int(DH_CFG.get("submit_conn_fails", 6))
 DH_QUERY_INTERVAL = float(DH_CFG.get("query_interval_sec", 2))
 DH_QUERY_TIMEOUT = float(DH_CFG.get("query_timeout_sec", 240))
+# 状态/进度连续多久没动就判该实例卡死（并行时一个实例挂掉不能拖死整条回复）。
+# 冷启动的首个任务可能 40-50s 不动（现场加载模型），所以留 90s 宽限。
+DH_STALL_TIMEOUT = float(DH_CFG.get("stall_timeout_sec", 90))
 DH_MAX_KEEP = int(DH_CFG.get("max_keep", 10))
+# 中间工作目录（<uuid>-sN / warmup-*）保留时长。DUIX 每个分段目录里是 png
+# 序列 + 上百个 2 帧 avi 分片 + audio_data.npy，一次对话能留几百 MB；这些
+# 文件还会挤掉 page cache，让下一次 concat avi 从 0.3s 退化到 9s（实测）。
+DH_WORKDIR_KEEP_HOURS = float(DH_CFG.get("workdir_keep_hours", 2))
+# 预热轮数：DUIX 容器里是多个 python worker 进程，各自独立冷启动 netG/TRT
+# （实测同一容器的首个 batch 要 20~35s，第二个任务起才降到 0.1s）。只预热
+# 一次只能热到其中一个进程，后续落在别的进程上的首段仍要吃满冷启动。多跑
+# 几轮（后台串行、不阻塞回复）能覆盖更多 worker。
+DH_WARMUP_ROUNDS = int(DH_CFG.get("warmup_rounds", 2))
 # 每段音频的文本上限：~48 字 ≈ 8~10s 音频（用户实测 10s 视频十几秒出片）
 DH_SEGMENT_CHARS = int(DH_CFG.get("segment_chars", 48))
+# 分段策略：
+#   "punct"：按标点断句，每句话单独出一段视频（当前默认，句子间不会半句断片）
+#   "chars"：按字数往 max_len 里凑整段（旧行为，段数少、总耗时短，但会在
+#            句子中间断片）
+DH_SEGMENT_MODE = str(DH_CFG.get("segment_mode", "punct")).strip().lower()
+# punct 模式下的最短段长：相邻短句合并到这么多字再出片（避免碎成几秒一片，
+# 播放端 3s 就播完、生成端却要 10s+，句间只能干等）。仍只在标点处切。
+DH_SEGMENT_MIN_CHARS = int(DH_CFG.get("segment_min_chars", 40))
+# ── 首段短切（2026-10-22，让首帧尽快出现）─────────────────────────────────
+# 每段生成耗时 ≈ 固定开销 + 与帧数成正比的部分，所以「第一段多长」几乎决定
+# 用户要干等多久才看到第一帧（实测一整段 13.68s 要 31s 才出片）。首段单独
+# 给一个小预算：只切出第一句话（不超过 first_segment_chars 字），后续段仍按
+# segment_chars 正常合并，避免为了首帧把整条回复切碎、把总耗时拉长。
+# 0 = 关闭（退回旧行为：全部段同一个预算）。
+DH_FIRST_SEGMENT_CHARS = int(DH_CFG.get("first_segment_chars", 24))
+# 首段下限：太短的碎片（「嗯。」）照样要付整段固定开销，却只播半秒，不值。
+DH_FIRST_SEGMENT_MIN_CHARS = int(DH_CFG.get("first_segment_min_chars", 10))
 DH_MAX_TEXT = 1000
+
+# ── 暖场（filler）语音（2026-10-22）─────────────────────────────────────────
+# 数字人每段固定开销很大（首帧要等十几秒），期间毫无声音 = 用户以为掉线。
+# 这里预生成一小批「嗯…」的短语音（同一音色，存盘复用），播放端在
+#   ① 受理回复时立刻播一句（open）
+#   ② 队列播空、后续段还没生成好时插一句（mid）
+# 预生成而不是实时 TTS：暖场的目的就是「立刻出声」，实时合成要 1-2s 且可能失败。
+# 文件按音色分目录（<persona>/open-0.wav…），切音色后重新合成。
+DH_WARMUP_CFG = DH_CFG.get("warmup") or {}
+DH_WARMUP_ENABLED = bool(DH_WARMUP_CFG.get("enabled", True))
+# 话术别用长串「……」：Qwen3 克隆会把省略号读成长停顿（实测「嗯……我看看啊。」
+# 合成出 5.6s，比整段视频还久）。用逗号/句号控制节奏，每条控制在 ~1-3s。
+_DEFAULT_WARMUP_LINES = {
+    "open": ["嗯，我看看啊。", "嗯，让我想想。", "哦，这个嘛。"],
+    "mid": ["嗯……", "那个……", "嗯，等我一下。"],
+}
+DH_WARMUP_LINES: dict[str, list[str]] = {}
+for _kind, _defaults in _DEFAULT_WARMUP_LINES.items():
+    _lines = DH_WARMUP_CFG.get(_kind) or _defaults
+    DH_WARMUP_LINES[_kind] = [str(s).strip() for s in _lines if str(s).strip()] or _defaults
+# 一段回复里最多插几句中间暖场（插多了像卡带，「嗯嗯嗯」很吵）
+DH_WARMUP_MAX_MID = int(DH_WARMUP_CFG.get("max_mid", 3))
+# 暖场产物目录：assets/warmup（与 bg-images / task-videos 同级，随 assets 一起挂载）
+# HERE 打底：cwd 不一定等于 /app，相对路径别靠运气（绝对路径时 HERE/x 仍返回 x）。
+DH_WARMUP_DIR = (HERE / BG_IMAGES_DIR).parent / "warmup"
 
 # ── DUIX 容器生命周期（2026-09-14：关掉数字人 = 连容器一起停，把显存还回去）──
 # 以前开关只管「桥接不再提交」，DUIX 容器仍常驻占着显存（模型十几 GB）。
 # 现在关闭时顺手 docker stop 容器（release_gpu=true），打开时 docker start
 # 并等它就绪（冷启动要加载模型，1-3 分钟）再预热。
 DH_CONTAINER = str(DH_CFG.get("container_name", "duix-avatar-gen-video"))
+# 与 DH_DUIX_BASES 一一对应的容器名（启停时要按实例逐个操作）
+_raw_containers = DH_CFG.get("container_names") or [DH_CONTAINER]
+DH_CONTAINERS: list[str] = [str(c).strip() for c in _raw_containers if str(c).strip()] or [DH_CONTAINER]
 DH_DOCKER_CLI = str(DH_CFG.get("docker_cli", "docker"))
 DH_RELEASE_GPU = bool(DH_CFG.get("stop_container_on_disable", True))
 
@@ -936,6 +1006,37 @@ def _dh_prune_videos() -> None:
                 logger.info("DH prune: deleted old temp wav %s", old.name)
             except Exception:  # noqa: BLE001
                 logger.exception("DH prune wav failed on %s", old)
+    _dh_prune_workdirs()
+
+
+_DH_WORKDIR_RE = re.compile(r"-s\d+$")
+
+
+def _dh_prune_workdirs() -> None:
+    """清掉过期的 DUIX 中间工作目录（`<uuid>-sN` / `warmup-*`）。
+
+    DUIX 从不自己回收这些目录：每段都留着 png 序列 + 上百个「2 帧一个」的
+    avi 分片 + audio_data.npy，一次对话就能堆几百 MB。除了占盘，它们还会把
+    page cache 挤掉 —— 实测同一批 avi 的 concat 在冷缓存下 9.03s、热缓存
+    0.34s，直接把每段的合成阶段拖慢一个量级。这里只按 mtime 回收过期的，
+    在途任务（几分钟内新建的）不动。
+    """
+    if DH_WORKDIR_KEEP_HOURS <= 0 or not DH_TEMP_DIR.is_dir():
+        return
+    deadline = time.time() - DH_WORKDIR_KEEP_HOURS * 3600
+    for entry in DH_TEMP_DIR.iterdir():
+        name = entry.name
+        if not entry.is_dir() or name == "output":
+            continue
+        if not (name.startswith("warmup-") or _DH_WORKDIR_RE.search(name)):
+            continue
+        try:
+            if entry.stat().st_mtime > deadline:
+                continue  # 还在期限内（可能正在生成）
+            shutil.rmtree(entry, ignore_errors=True)
+            logger.info("DH prune: removed workdir %s", name)
+        except Exception:  # noqa: BLE001
+            logger.exception("DH prune workdir failed on %s", name)
 
 
 def _dh_record_history(code: str, video_file: str, text: str) -> None:
@@ -1039,7 +1140,16 @@ async def dh_speak(req: DHSpeakRequest) -> dict:
     logger.info("DH enqueue: %s (%d chars), pending=%d", code, len(text), pending)
     _dh_stat("submits")
     _dh_stats["last_submit_at"] = time.time()
-    return {"ok": True, "code": code}
+    # 暖场音频随提交一起返回：前端拿到就立刻播「嗯…」，不用再发一次请求
+    # （数字人的首帧要等十几秒，这声应答是唯一的即时反馈）。
+    warmup = _warmup_urls(_current_persona)
+    if DH_WARMUP_ENABLED:
+        if not warmup["open"] or not warmup["mid"]:
+            asyncio.create_task(_ensure_warmup(_current_persona))  # 缺的下次就有了
+        elif any(i["video"] is None for k in ("open", "mid") for i in warmup[k]):
+            # 有声音但还没渲染出口型动画：后台补（真实任务优先，抢不到就下次）
+            asyncio.create_task(_ensure_warmup_videos(_current_persona))
+    return {"ok": True, "code": code, "warmup": warmup}
 
 
 class DHDiscardRequest(BaseModel):
@@ -1068,12 +1178,28 @@ async def dh_status() -> dict:
     return _dh_get()
 
 
+@app.get("/api/dh/warmup")
+async def dh_warmup() -> dict:
+    """当前音色的暖场音频清单（开场 open / 中间 mid）。
+
+    顺带在后台补齐缺失的语音：刚切过音色或首次启动时清单可能是空的，
+    下次请求就有了。前端用 speak 返回里那份即可，这个接口用于排查。
+    """
+    urls = _warmup_urls(_current_persona)
+    if DH_WARMUP_ENABLED:
+        if not urls["open"] or not urls["mid"]:
+            asyncio.create_task(_ensure_warmup(_current_persona))
+        elif any(i["video"] is None for k in ("open", "mid") for i in urls[k]):
+            asyncio.create_task(_ensure_warmup_videos(_current_persona))
+    return {"voice": _current_persona, "enabled": DH_WARMUP_ENABLED, **urls}
+
+
 class DHEnableRequest(BaseModel):
     enabled: bool
 
 
 @app.post("/api/dh/enable")
-async def dh_enable(req: DHEnableRequest) -> dict:
+async def dh_enable(req: DHEnableRequest, request: Request) -> dict:
     """运行时开关数字人（热切换，无需重启桥接；并持久化到 bridge-config.json）。
 
     ON  ：起 worker、确保 DUIX 容器在跑（必要时 docker start + 等就绪）、预热
@@ -1113,7 +1239,13 @@ async def dh_enable(req: DHEnableRequest) -> dict:
     else:
         _dh_duix_set("running", "容器保持运行（release_gpu=false）")
     _persist_dh_enabled(enabled)
-    logger.info("DH runtime switch: %s (container stop=%s)", "ON" if enabled else "OFF", DH_RELEASE_GPU)
+    # 记录调用方：开关抖动排查时能看出是哪个页面/窗口打过来的（多窗口各自
+    # localStorage 不一致时，重挂载推送会把正在生成的容器 stop 掉）。
+    caller = request.headers.get("referer") or request.headers.get("origin") or "-"
+    logger.info(
+        "DH runtime switch: %s (container stop=%s, caller=%s)",
+        "ON" if enabled else "OFF", DH_RELEASE_GPU, caller,
+    )
     return {"ok": True, "enabled": enabled, "changed": True, "duix": dict(_dh_duix)}
 
 
@@ -1186,6 +1318,84 @@ def _split_segments(text: str, max_len: int = 48) -> list[str]:
     return out
 
 
+def _split_by_punct(text: str, max_len: int = 96, min_len: int = 40) -> list[str]:
+    """按标点断句成段：**只在标点处切**，但会把相邻短句合并到 min_len 以上。
+
+    规则（segment_mode="punct"，2026-10-21 加）：
+      1. 先按句末标点（。！？!?；;…换行）切出句子，**绝不在句子中间断片**；
+      2. 单句超过 max_len 时，才按句内标点（，、：,:）继续切；
+      3. 切完仍超长（无标点的长串）才按字数硬切；
+      4. 合并短句：相邻句子往后拼，直到凑够 min_len 或再拼就超 max_len；
+         这样两句「嗯。」「好的呀。」不会被拆成两条几秒的碎视频，播放端
+         才不会追不上生成端（每段生成固定要 10s+，音频只有 3s 就必然空转）。
+      5. 纯标点/空白碎片丢弃。
+    """
+    import re
+
+    pieces: list[str] = []
+
+    def push(piece: str) -> None:
+        piece = piece.strip()
+        while len(piece) > max_len:  # 无标点长串：只能硬切
+            pieces.append(piece[:max_len])
+            piece = piece[max_len:].strip()
+        if piece:
+            pieces.append(piece)
+
+    for sent in re.split(r"(?<=[。！？!?；;…\n])", text):
+        sent = sent.strip()
+        if not sent:
+            continue
+        if len(sent) <= max_len:
+            pieces.append(sent)
+            continue
+        for clause in re.split(r"(?<=[，、：,:])", sent):
+            clause = clause.strip()
+            if clause:
+                push(clause)
+
+    # 合并短句（仍在标点边界上拼，不会切到句子中间）
+    out: list[str] = []
+    cur = ""
+    for piece in pieces:
+        if cur and (len(cur) >= min_len or len(cur) + len(piece) > max_len):
+            out.append(cur)
+            cur = piece
+        else:
+            cur += piece
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _take_first_segment(text: str, limit: int, floor: int = 10) -> tuple[str, str]:
+    """把文本切成 (首段, 剩余)，首段长度不超过 limit 字。
+
+    只在标点处切（句末标点 → 句内标点 → 实在没有才硬切），并保证不短于
+    floor 字。目的是让「第一段」尽量短，从而让第一帧尽早出现；剩余部分
+    交给 _split_by_punct 按正常预算切，总段数/总耗时基本不变。
+    """
+    text = text.strip()
+    if limit <= 0 or len(text) <= limit:
+        return text, ""
+
+    head = text[:limit]
+    cut = -1
+    for pat in (r"[。！？!?；;…\n]", r"[，、：,:]"):
+        for m in re.finditer(pat, head):
+            if m.end() >= floor:
+                cut = m.end()
+                break
+        if cut < 0:  # 没有满足 floor 的边界：退而求其次取最后一个
+            for m in re.finditer(pat, head):
+                cut = m.end()
+        if cut > 0:
+            break
+    if cut < 0:
+        cut = limit
+    return text[:cut].strip(), text[cut:].strip()
+
+
 def _synthesize_full(handler, text: str) -> np.ndarray:
     """整段回复 TTS：超长文本分块合成后拼接为一条连续 int16 音频。"""
     persona = PERSONAS.get(_current_persona, {})
@@ -1217,14 +1427,280 @@ def _synthesize_full(handler, text: str) -> np.ndarray:
     return np.concatenate(chunks)
 
 
-async def _dh_submit(client: httpx.AsyncClient, payload: dict) -> dict:
-    resp = await client.post(f"{DH_DUIX_BASE}/easy/submit", json=payload)
+# ── 暖场语音：预生成 + 落盘复用 ──────────────────────────────────────────────
+# 为什么预生成：暖场的唯一价值是「立刻出声」，实时 TTS 要 1-2s 且偶尔失败，
+# 那就又变成干等了。合成一次存 assets/warmup/<persona>/，之后纯静态文件。
+_warmup_lock = asyncio.Lock()
+
+
+def _warmup_safe_name(persona: str) -> str:
+    """音色名 → 安全的目录名（音色名可能带空格/中文标点）。"""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(persona or "default")) or "default"
+
+
+def _warmup_names(persona: str) -> dict[str, list[str]]:
+    """暖场 wav 的相对文件名（<persona>/<kind>-<i>-<hash>.wav，按音色分目录）。
+
+    文件名带话术哈希：改了 bridge-config 里的暖场话术，旧音频自动失效并
+    重新合成——否则改了配置却还在播老台词，排查起来非常费劲。
+    """
+    safe = _warmup_safe_name(persona)
+    return {
+        kind: [
+            f"{safe}/{kind}-{i}-{hashlib.md5(t.encode('utf-8')).hexdigest()[:6]}.wav"
+            for i, t in enumerate(lines)
+        ]
+        for kind, lines in DH_WARMUP_LINES.items()
+    }
+
+
+def _warmup_video_name(wav_name: str) -> str:
+    """暖场 wav 名 → 对应视频名（同基名换后缀，保留 persona 子目录）。"""
+    return wav_name[:-4] + ".mp4" if wav_name.lower().endswith(".wav") else wav_name + ".mp4"
+
+
+def _warmup_urls(persona: str | None = None) -> dict:
+    """可用的暖场条目：video（数字人口型）优先，audio 兜底。
+
+    视频是用 DUIX 离线渲染的（与真实段同一形象，见 _ensure_warmup_videos）；
+    还没渲染完时 video 为 None，前端退化成「有声无口型」，不能让暖场因为
+    渲染没跑完就整个消失。
+    """
+    if not DH_WARMUP_ENABLED:
+        return {"open": [], "mid": [], "max_mid": 0}
+    names = _warmup_names(persona or _current_persona)
+    out: dict[str, list[dict]] = {}
+    for kind, ns in names.items():
+        items: list[dict] = []
+        for n in ns:
+            if not (DH_WARMUP_DIR / n).is_file():
+                continue
+            vname = _warmup_video_name(n)
+            items.append({
+                "audio": f"/media/warmup/{n}",
+                "video": f"/media/warmup/{vname}" if (DH_WARMUP_DIR / vname).is_file() else None,
+            })
+        out[kind] = items
+    return {**out, "max_mid": DH_WARMUP_MAX_MID}
+
+
+async def _ensure_warmup(persona: str | None = None) -> None:
+    """合成当前音色缺失的暖场语音（后台任务；已存在的直接跳过）。
+
+    与真实合成共用 infer_lock，避免和正在生成的回复抢 GPU；合成期间音色
+    被切走就放弃（旧音色的暖场没用）。
+    """
+    if not DH_WARMUP_ENABLED:
+        return
+    persona = persona or _current_persona
+    async with _warmup_lock:
+        names = _warmup_names(persona)
+        todo = [
+            (kind, i, name)
+            for kind, ns in names.items()
+            for i, name in enumerate(ns)
+            if not (DH_WARMUP_DIR / name).is_file()
+        ]
+        if not todo:
+            return
+        logger.info("DH warmup lines: synthesizing %d line(s) for voice %s", len(todo), persona)
+        async with models.infer_lock:
+            if persona != _current_persona:
+                logger.info("DH warmup lines: voice switched meanwhile, skipping")
+                return
+            if PERSONAS.get(persona, {}).get("engine", "qwen3") == "qwen3":
+                handler = await models.ensure_tts()
+            else:
+                handler = None  # CosyVoice / OmniVoice 走各自远端，不需要本地 handler
+            for kind, i, name in todo:
+                if persona != _current_persona:
+                    return
+                try:
+                    samples = await asyncio.to_thread(
+                        _synthesize_full, handler, DH_WARMUP_LINES[kind][i]
+                    )
+                    path = DH_WARMUP_DIR / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(_pcm16_to_wav(samples))
+                except Exception:  # noqa: BLE001 - 暖场失败不影响主链路
+                    logger.exception("DH warmup line failed: %s/%d", kind, i)
+                    continue
+                logger.info("DH warmup line -> %s (%.2fs)", name, len(samples) / 16000.0)
+        # 清掉这个音色下过期的产物（改过话术、或上次没合成完的残留）
+        keep = {Path(n).name for ns in names.values() for n in ns}
+        keep |= {_warmup_video_name(n) for n in keep}
+        folder = DH_WARMUP_DIR / _warmup_safe_name(persona)
+        if folder.is_dir():
+            for old in folder.iterdir():
+                if old.is_file() and old.suffix.lower() in (".wav", ".mp4") and old.name not in keep:
+                    old.unlink(missing_ok=True)
+
+
+async def _dh_render_warmup_video(wav_name: str, base: str) -> str | None:
+    """把一段暖场语音提交 DUIX 渲染成开口说话的小视频，返回产物文件名。
+
+    走与真实任务相同的 submit/query 协议，但**不碰 _dh_state**：这是纯离线
+    产物，不该让插件端的进度条/播放队列看到它。
+    """
+    code = f"wvid-{uuid4()}"
+    payload = {
+        "code": code,
+        "audio_url": wav_name,
+        "video_url": _persona_avatar(),
+        "watermark_switch": 0,
+        "digital_auth": 0,
+        "chaofen": 0,
+        "pn": 1,
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        submitted = False
+        for _ in range(12):  # busy 时最多等 ~1 分钟，之后放弃（下次再补）
+            try:
+                resp = await _dh_submit(client, payload, base)
+            except Exception:  # noqa: BLE001
+                return None
+            if resp.get("code") == 10000:
+                submitted = True
+                break
+            if resp.get("code") == 10001:
+                await asyncio.sleep(DH_SUBMIT_RETRY_SEC)
+                continue
+            return None
+        if not submitted:
+            return None
+        deadline = time.time() + DH_QUERY_TIMEOUT
+        while time.time() < deadline:
+            await asyncio.sleep(DH_QUERY_INTERVAL)
+            try:
+                q = await _dh_query(client, code, base)
+            except Exception:  # noqa: BLE001
+                continue
+            if not q:
+                continue
+            status = str(q.get("status"))
+            if status in ("2", "success", "s", "done", "finished", "成功"):
+                return str(q.get("result") or "").rsplit("/", 1)[-1] or None
+            if status in ("3", "error", "e", "failed", "失败"):
+                return None
+    return None
+
+
+def _pad_wav_min_sec(src: Path, dst: Path, min_sec: float = 1.2) -> None:
+    """把 wav 补静音到至少 min_sec 秒再交给 DUIX。
+
+    实测极短音频（「嗯……」0.56s）会让 DUIX 渲染失败——帧数太少凑不出
+    一条视频。多出来的静音只是画面停住，比暖场缺一条要好。
+    """
+    import wave
+
+    with wave.open(str(src), "rb") as w:
+        params = w.getparams()
+        frames = w.readframes(w.getnframes())
+    need = int(min_sec * params.framerate) - params.nframes
+    if need > 0:
+        frames += b"\x00" * (need * params.sampwidth * params.nchannels)
+    with wave.open(str(dst), "wb") as w:
+        w.setparams(params)
+        w.writeframes(frames)
+
+
+async def _ensure_warmup_videos(persona: str | None = None) -> None:
+    """用 DUIX 把暖场语音渲染成「有口型」的暖场动画（一次性，之后纯静态）。
+
+    为什么值得：暖场期间如果只是待机动画 + 声音，嘴不动却有声，一眼假。
+    用参考形象渲染 6 条 2 秒的小片段，暖场就变成了「她真的在应答」。
+    代价只是首次（或换音色后）离线跑几分钟，之后永远是静态文件。
+
+    让路策略：每段开始前看 DUIX lane 是否被真实任务占着，占着就整体退出，
+    绝不和真实回复抢 GPU（真实回复的等待远比补齐暖场动画重要）。
+    """
+    if not DH_WARMUP_ENABLED:
+        return
+    persona = persona or _current_persona
+    await _ensure_warmup(persona)  # 先保证音频在，视频才有得渲染
+    base = DH_DUIX_BASES[0]
+    if not await _dh_reachable(base=base):
+        logger.info("DH warmup videos: DUIX unreachable, skipped")
+        return
+    names = _warmup_names(persona)
+    todo: list[tuple[Path, Path]] = []
+    for ns in names.values():
+        for n in ns:
+            wav_path = DH_WARMUP_DIR / n
+            mp4_path = DH_WARMUP_DIR / _warmup_video_name(n)
+            if wav_path.is_file() and not mp4_path.is_file():
+                todo.append((wav_path, mp4_path))
+    if not todo:
+        return
+    logger.info("DH warmup videos: rendering %d clip(s) for voice %s", len(todo), persona)
+    sem = _dh_lane_lock(base)
+    fails = 0
+    for wav_path, mp4_path in todo:
+        if not _dh_enabled_now() or persona != _current_persona:
+            return
+        if sem.locked():
+            logger.info("DH warmup videos: lane busy with a real task, pausing")
+            return
+        async with sem:
+            tmp_wav = DH_TEMP_DIR / f"wv-{uuid4().hex[:10]}.wav"
+            fname: str | None = None
+            try:
+                await asyncio.to_thread(_pad_wav_min_sec, wav_path, tmp_wav)
+                fname = await _dh_render_warmup_video(tmp_wav.name, base)
+            except Exception:  # noqa: BLE001
+                logger.exception("DH warmup video render failed: %s", wav_path.name)
+            finally:
+                tmp_wav.unlink(missing_ok=True)
+            if not fname:
+                # 单条失败（某句话 DUIX 就是渲染不出来）不该拖累其余几条
+                fails += 1
+                logger.warning("DH warmup video failed for %s (%d)", wav_path.name, fails)
+                if fails >= 2:
+                    return
+                continue
+            host = DH_TEMP_DIR / fname
+            for _ in range(15):
+                if host.is_file():
+                    break
+                await asyncio.sleep(1)
+            try:
+                mp4_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(host), str(mp4_path))
+                logger.info("DH warmup video -> %s", mp4_path.name)
+                fails = 0
+            except Exception:  # noqa: BLE001
+                logger.exception("DH warmup video move failed: %s", fname)
+                return
+
+
+# ── 每实例串行闸门（2026-10-21）──────────────────────────────────────────────
+# DUIX 服务端是多个 worker 进程（容器内 4 个 python），每个进程各持一份
+# run_flag，所以「单实例同时只跑一个任务 / 忙时返回 10001」只在**进程内**成立。
+# 实测：同一个容器上 -s1 与 -s2 同时在跑 netG，-s2 的 98 个 batch 里有 8 个被
+# 拖到 2~12s，光这 8 个就占了 53.5s 总推断时间里的 44s（GPU 争用远慢于串行）。
+# 因此在客户端侧给每个 base 一把 asyncio 信号量，把「提交 → 轮询到成品」这段
+# 严格串行化。多实例（duix_bases 配多个）时各 base 各一把，互不影响。
+_dh_lane_locks: dict[str, asyncio.Semaphore] = {}
+
+
+def _dh_lane_lock(base: str | None = None) -> asyncio.Semaphore:
+    """取某个 DUIX 实例的串行锁（惰性创建，必须在事件循环里首次调用）。"""
+    key = (base or DH_DUIX_BASE).rstrip("/")
+    sem = _dh_lane_locks.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(1)
+        _dh_lane_locks[key] = sem
+    return sem
+
+
+async def _dh_submit(client: httpx.AsyncClient, payload: dict, base: str | None = None) -> dict:
+    resp = await client.post(f"{base or DH_DUIX_BASE}/easy/submit", json=payload)
     resp.raise_for_status()
     return resp.json()
 
 
-async def _dh_query(client: httpx.AsyncClient, code: str) -> dict | None:
-    resp = await client.get(f"{DH_DUIX_BASE}/easy/query", params={"code": code})
+async def _dh_query(client: httpx.AsyncClient, code: str, base: str | None = None) -> dict | None:
+    resp = await client.get(f"{base or DH_DUIX_BASE}/easy/query", params={"code": code})
     resp.raise_for_status()
     body = resp.json()
     if body.get("code") == 10004:  # 任务不存在（可能刚提交或已被消费）
@@ -1233,98 +1709,173 @@ async def _dh_query(client: httpx.AsyncClient, code: str) -> dict | None:
 
 
 async def _dh_run(item: dict) -> None:
-    """处理一个数字人回复：切成 <=10s 的小段 → 逐段 TTS + 提交 DUIX。
+    """处理一个数字人回复：切成语义完整的小段 → 逐段 TTS + 提交 DUIX。
 
     流水线：当前段在 DUIX 生成期间，后台预合成下一段的 TTS 音频；DUIX
     一空闲立即提交下一段。各段成品视频按顺序收进 status.videos，插件端
     逐个续接播放（一段播完马上接下一段）。段太长时 DUIX 单任务排队。
+    首段单独走 first_segment_chars 的小预算（首帧尽早出现），其余段按
+    segment_chars / segment_min_chars 正常合并（保总时长）。
     """
     code, text = item["code"], item["text"]
-    segments = [s for s in _split_segments(text, DH_SEGMENT_CHARS) if s]
+    # 首段短切：先把第一句单独取出（≤ first_segment_chars 字），剩下的再按
+    # 正常预算成段。首段决定首帧延迟，其余段决定后续吞吐，两者解耦。
+    head = ""
+    body = text
+    if DH_FIRST_SEGMENT_CHARS > 0:
+        head, body = _take_first_segment(text, DH_FIRST_SEGMENT_CHARS, DH_FIRST_SEGMENT_MIN_CHARS)
+        if not body:
+            head = ""  # 整条回复还没首段长，没必要特殊处理
+    if DH_SEGMENT_MODE in ("punct", "punctuation"):
+        segments = [s for s in _split_by_punct(body or text, DH_SEGMENT_CHARS, DH_SEGMENT_MIN_CHARS) if s]
+    else:
+        segments = [s for s in _split_segments(body or text, DH_SEGMENT_CHARS) if s]
+    if head:
+        segments.insert(0, head)
+        logger.info(
+            "DH %s: first segment shortened to %d chars (limit %d) — first frame sooner",
+            code, len(head), DH_FIRST_SEGMENT_CHARS,
+        )
     if not segments:
         _dh_set(state="error", message="文本为空", code=code, text=text)
         return
     total = len(segments)
+    # lane 数 = DUIX 实例数（每实例同时只能跑一个任务），第 i 段固定发给
+    # 第 i % lanes 个实例。两段并行渲染后 GPU 峰值从 ~70% 到 ~96%。
+    lanes = max(1, min(len(DH_DUIX_BASES), total))
     try:
         _dh_set(
             state="tts", message="语音合成中…", code=code, text=text,
             video_file="", video_url="", videos=[], total_segments=total,
             done_segments=0, progress=0,
         )
-        async with httpx.AsyncClient(timeout=20) as client:
-            pending_synth: asyncio.Task | None = None
-            for i, seg_text in enumerate(segments):
+        clients = [httpx.AsyncClient(timeout=20) for _ in range(lanes)]
+        rendered: dict[int, str] = {}
+        started = 0   # 已启动渲染的分段数
+        appended = 0  # 已按顺序收进 videos 的分段数
+        failed = False
+        # TTS 预取表：DUIX 在跑当前段时，下一段的语音已经在合成。TTS 走
+        # models.infer_lock（串行），并发请求只是排队；但排队这段时间与视频
+        # 生成重叠，正好把原先卡在关键路径上的「段间 ~2.4s」吃掉。
+        tts_prefetch: dict[int, asyncio.Task[Path]] = {}
+
+        def _prefetch_tts(idx: int) -> asyncio.Task[Path]:
+            """取（或首次创建）第 idx 段的 TTS 任务。"""
+            task = tts_prefetch.get(idx)
+            if task is None:
+                task = asyncio.create_task(_dh_synth_segment(segments[idx]))
+                tts_prefetch[idx] = task
+            return task
+
+        async def render(idx: int) -> bool:
+            """提交 + 轮询成品；成功则把文件名写进 rendered。语音用预取好的那份。"""
+            _dh_set(
+                state="generating",
+                message=f"数字人生成中 {appended + 1}/{total}…",
+                code=code, text=text, done_segments=appended,
+                progress=round(appended / total * 100),
+            )
+            wav_path = await _prefetch_tts(idx)
+            lane = idx % lanes
+            fname = await _dh_submit_and_wait(
+                clients[lane], f"{code}-s{idx}", wav_path, code, text, DH_DUIX_BASES[lane],
+            )
+            if fname is None:
+                return False
+            rendered[idx] = fname
+            return True
+
+        inflight: dict[int, asyncio.Task] = {}
+        try:
+            while appended < total:
+                # 补满 lane（判废/被新回复顶替就停止再启动新段）
+                while started < total and len(inflight) < lanes:
+                    if code in _dh_discarded:
+                        break
+                    if _dh_has_newer_pending():
+                        # 更新的回复已提交：停掉本任务剩余段，把 DUIX 让给最新回复。
+                        # 已生成的段视频保留在磁盘；新任务开始后 companion 自动
+                        # 切到新任务的播放列表。
+                        _dh_set(
+                            state="discarded", message="被新回复取代",
+                            progress=round(appended / total * 100),
+                            code=code, text=text, done_segments=appended,
+                        )
+                        logger.info(
+                            "DH %s: preempted by newer task at segment %d/%d",
+                            code, appended, total,
+                        )
+                        failed = True
+                        break
+                    inflight[started] = asyncio.create_task(render(started))
+                    # 当前段一开跑，就把下一段的 TTS 排上（段 0 的 TTS 由
+                    # render(0) 自己发起，这里补的是它后面那段）。
+                    if started + 1 < total:
+                        _prefetch_tts(started + 1)
+                    started += 1
                 if code in _dh_discarded:
                     _dh_set(state="discarded", message="已取消（被打断）", progress=0, code=code, text=text, videos=[])
-                    logger.info("DH %s: discarded before segment %d", code, i)
-                    return
-                if _dh_has_newer_pending():
-                    # 更新的回复已提交：停止本任务剩余段，把 DUIX 让给最新回复。
-                    # 已生成的段视频保留在磁盘（存取不受影响）；新任务开始后
-                    # （code 变化）companion 自动切到新任务的播放列表。
-                    _dh_set(
-                        state="discarded", message="被新回复取代",
-                        progress=round(i / total * 100),
-                        code=code, text=text, done_segments=i,
-                    )
-                    logger.info("DH %s: preempted by newer task at segment %d/%d", code, i, total)
-                    return
-                _dh_set(
-                    state="generating",
-                    message=f"数字人生成中 {i + 1}/{total}…",
-                    code=code, text=text, done_segments=i,
-                    progress=round(i / total * 100),
+                    logger.info("DH %s: discarded before segment %d", code, started)
+                    failed = True
+                if not inflight:
+                    break
+                done_set, _ = await asyncio.wait(
+                    inflight.values(), return_when=asyncio.FIRST_COMPLETED,
                 )
-                # 当前段音频：优先用流水线预合成好的；否则现合成
-                if pending_synth is not None:
-                    wav_path = await pending_synth
-                    pending_synth = None
-                else:
-                    wav_path = await _dh_synth_segment(seg_text)
-                # 预合成下一段（当前段在 DUIX 生成期间并行跑）
-                next_synth: asyncio.Task | None = None
-                if i + 1 < total:
-                    next_synth = asyncio.create_task(_dh_synth_segment(segments[i + 1]))
-                # 提交 + 轮询当前段，拿到成品文件名
-                seg_code = f"{code}-s{i}"
-                fname = await _dh_submit_and_wait(client, seg_code, wav_path, code, text)
-                if fname is None:
-                    if next_synth is not None:
-                        next_synth.cancel()
-                    if code in _dh_discarded:
-                        _dh_set(state="discarded", message="已取消（被打断）", progress=0, code=code, text=text, videos=[])
-                    return  # 错误/超时状态已由 _dh_submit_and_wait 设置
-                with _dh_lock:
-                    videos = _dh_state.get("videos", [])
-                    videos = videos + [{"video_file": fname, "video_url": f"/media/dh/{fname}"}]
-                    _dh_state["videos"] = videos
-                _dh_record_history(seg_code, fname, seg_text)
-                if next_synth is not None:
+                for idx, task in list(inflight.items()):
+                    if task not in done_set:
+                        continue
+                    del inflight[idx]
                     try:
-                        await next_synth
+                        ok = task.result()
                     except Exception:  # noqa: BLE001
-                        logger.exception("DH %s: next synth failed", code)
-                _dh_set(
-                    state="generating",
-                    message=f"数字人生成中 {i + 2}/{total}…",
-                    code=code, text=text, done_segments=i + 1,
-                    progress=round((i + 1) / total * 100),
-                )
-            # 全部段落完成
-            with _dh_lock:
-                videos = list(_dh_state.get("videos", []))
-            first = videos[0] if videos else {}
-            _dh_set(
-                state="done", message="数字人视频已就绪", progress=100,
-                video_file=first.get("video_file", ""),
-                video_url=first.get("video_url", ""),
-                code=code, text=text, total_segments=total, done_segments=total,
-            )
-            _dh_prune_videos()
-            logger.info(
-                "DH %s: done, %d segment(s): %s",
-                code, total, [v["video_file"] for v in videos],
-            )
+                        logger.exception("DH %s: segment %d failed", code, idx)
+                        ok = False
+                    if not ok:
+                        failed = True
+                # 按顺序入库：并行完成顺序可能乱，播放端依赖 videos 的顺序续播
+                while appended in rendered:
+                    fname = rendered.pop(appended)
+                    with _dh_lock:
+                        videos = _dh_state.get("videos", [])
+                        videos = videos + [{"video_file": fname, "video_url": f"/media/dh/{fname}"}]
+                        _dh_state["videos"] = videos
+                    _dh_record_history(f"{code}-s{appended}", fname, segments[appended])
+                    appended += 1
+                    _dh_set(
+                        state="generating",
+                        message=f"数字人生成中 {appended}/{total}…",
+                        code=code, text=text, done_segments=appended,
+                        progress=round(appended / total * 100),
+                    )
+                if failed:
+                    break
+        finally:
+            for task in inflight.values():
+                task.cancel()
+            # 预取但没用上的 TTS 一并取消（判废 / 提前失败时会有剩余）。
+            for task in tts_prefetch.values():
+                if not task.done():
+                    task.cancel()
+            for client in clients:
+                await client.aclose()
+        if failed:
+            return  # 状态已由 _dh_submit_and_wait / 判废分支设置
+        # 全部段落完成
+        with _dh_lock:
+            videos = list(_dh_state.get("videos", []))
+        first = videos[0] if videos else {}
+        _dh_set(
+            state="done", message="数字人视频已就绪", progress=100,
+            video_file=first.get("video_file", ""),
+            video_url=first.get("video_url", ""),
+            code=code, text=text, total_segments=total, done_segments=total,
+        )
+        _dh_prune_videos()
+        logger.info(
+            "DH %s: done, %d segment(s) via %d lane(s): %s",
+            code, total, lanes, [v["video_file"] for v in videos],
+        )
     except Exception as exc:  # noqa: BLE001 - surfaced to the plugin
         logger.exception("DH %s: task failed", code)
         if code in _dh_discarded:
@@ -1354,6 +1905,22 @@ async def _dh_submit_and_wait(
     wav_path: Path,
     reply_code: str,
     reply_text: str,
+    base: str | None = None,
+) -> str | None:
+    """持有该实例串行锁后提交并等待成品（避免同实例多任务抢 GPU）。"""
+    async with _dh_lane_lock(base):
+        return await _dh_submit_and_wait_impl(
+            client, seg_code, wav_path, reply_code, reply_text, base,
+        )
+
+
+async def _dh_submit_and_wait_impl(
+    client: httpx.AsyncClient,
+    seg_code: str,
+    wav_path: Path,
+    reply_code: str,
+    reply_text: str,
+    base: str | None = None,
 ) -> str | None:
     """提交一段到 DUIX 并轮询到成品视频；返回文件名，失败返回 None。
 
@@ -1379,7 +1946,7 @@ async def _dh_submit_and_wait(
             logger.info("DH %s: aborted (digital human switched off)", seg_code)
             return None
         try:
-            resp = await _dh_submit(client, payload)
+            resp = await _dh_submit(client, payload, base)
         except Exception as exc:  # noqa: BLE001
             # DUIX 不可达（容器没起/正在冷启动）：前几次静默重试，连续失败到
             # 阈值就判死回退 TTS。容器正在 starting/stopping 时给足宽限
@@ -1390,12 +1957,12 @@ async def _dh_submit_and_wait(
             if submit_fails == 1:
                 logger.warning(
                     "DH %s: DUIX unreachable at %s (%s) — retrying up to %d×",
-                    seg_code, DH_DUIX_BASE, type(exc).__name__, max_fails,
+                    seg_code, base or DH_DUIX_BASE, type(exc).__name__, max_fails,
                 )
             if submit_fails >= max_fails:
                 _dh_set(
                     state="error",
-                    message=f"DUIX 不可达（{DH_DUIX_BASE} 未响应）",
+                    message=f"DUIX 不可达（{base or DH_DUIX_BASE} 未响应）",
                     code=reply_code, text=reply_text,
                 )
                 return None
@@ -1416,15 +1983,30 @@ async def _dh_submit_and_wait(
         return None
 
     deadline = time.time() + DH_QUERY_TIMEOUT
+    # 停滞看门狗：多实例并行时偶尔会有一个实例的流水线卡死（progress 长时间
+    # 不动、状态一直 1）。不检测的话这一段要干等 4 分钟才超时，把整条回复拖住。
+    stalled_sig: tuple[str, str] | None = None
+    stalled_since = time.time()
     while time.time() < deadline:
         if not _dh_enabled_now():
             logger.info("DH %s: polling aborted (digital human switched off)", seg_code)
             return None
         await asyncio.sleep(DH_QUERY_INTERVAL)
-        q = await _dh_query(client, seg_code)
+        q = await _dh_query(client, seg_code, base)
         if q is None:
             continue
         status = str(q.get("status"))
+        sig = (status, str(q.get("progress")))
+        if sig != stalled_sig:
+            stalled_sig, stalled_since = sig, time.time()
+        elif status not in ("2", "success", "s", "done", "finished", "成功") and time.time() - stalled_since > DH_STALL_TIMEOUT:
+            logger.warning(
+                "DH %s: stalled at %s (progress=%s) for %.0fs — giving up",
+                seg_code, base or DH_DUIX_BASE, q.get("progress"), time.time() - stalled_since,
+            )
+            _dh_set(state="error", message="生成停滞（DUIX 实例无响应，正在重启容器）", code=reply_code, text=reply_text)
+            _dh_restart_container_for(base or DH_DUIX_BASE)
+            return None
         if status in ("2", "success", "s", "done", "finished", "成功"):
             fname = str(q.get("result") or "").rsplit("/", 1)[-1]
             host = DH_TEMP_DIR / fname
@@ -1481,26 +2063,69 @@ def _dh_ensure_worker() -> None:
         logger.info("DH worker started")
 
 
-async def _dh_reachable(timeout: float = 3.0) -> bool:
+async def _dh_reachable(timeout: float = 3.0, base: str | None = None) -> bool:
     """DUIX 是否可达：GET /easy/query 探活（容器没起时立刻 False，不重试）。"""
+    url = base or DH_DUIX_BASE
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(f"{DH_DUIX_BASE}/easy/query", params={"code": "probe"})
+            resp = await client.get(f"{url}/easy/query", params={"code": "probe"})
             return resp.status_code < 500
     except Exception:  # noqa: BLE001
         return False
 
 
+async def _dh_all_reachable() -> bool:
+    """所有实例都可达才算就绪（多实例时缺一个就只能串行，值得再等等）。"""
+    for base in DH_DUIX_BASES:
+        if not await _dh_reachable(base=base):
+            return False
+    return True
+
+
+def _dh_restart_container_for(base: str) -> None:
+    """某个实例流水线卡死（busy 不释放）时，用 docker restart 把它救回来。
+
+    DUIX 的卡死状态自愈不了（任务队列一直占着，后续 submit 全 10001），
+    实测只能重启容器。这里后台上火，不阻塞当前回复（已经把错误报给前端了）。
+    """
+    try:
+        idx = DH_DUIX_BASES.index(base)
+    except ValueError:
+        idx = 0
+    if not DH_CONTAINERS:
+        return
+    name = DH_CONTAINERS[idx % len(DH_CONTAINERS)]
+
+    async def _restart() -> None:
+        logger.warning("DH: restarting stuck DUIX container %s", name)
+        ok, out = await asyncio.to_thread(_docker, ["restart", name], 240)
+        if ok:
+            _dh_duix_set("running", "DUIX 已重启")
+            logger.info("DH: container %s restarted after stall", name)
+        else:
+            _dh_duix_set("unavailable", f"重启容器失败: {out[:160]}")
+            logger.warning("DH: restart %s failed: %s", name, out)
+
+    asyncio.create_task(_restart())
+
+
 async def _dh_container_stop() -> None:
-    """停掉 DUIX 容器，把显存真的还回去（关数字人 = 连 GPU 一起放）。"""
+    """停掉全部 DUIX 容器，把显存真的还回去（关数字人 = 连 GPU 一起放）。"""
     _dh_duix_set("stopping", "正在停止 DUIX 容器…")
-    ok, out = await asyncio.to_thread(_docker, ["stop", DH_CONTAINER], 180)
-    if ok:
+    ok_all = True
+    outs: list[str] = []
+    for name in DH_CONTAINERS:
+        ok, out = await asyncio.to_thread(_docker, ["stop", name], 180)
+        outs.append(out)
+        ok_all = ok_all and ok
+        if ok:
+            logger.info("DH container stopped (%s): %s", name, out)
+        else:
+            logger.warning("DH container stop failed (%s): %s", name, out)
+    if ok_all:
         _dh_duix_set("stopped", "DUIX 已停止，显存已释放")
-        logger.info("DH container stopped (%s): %s", DH_CONTAINER, out)
     else:
-        _dh_duix_set("unknown", f"停止容器失败: {out[:160]}")
-        logger.warning("DH container stop failed: %s", out)
+        _dh_duix_set("unknown", f"停止容器失败: {'; '.join(outs)[:160]}")
 
 
 async def _dh_wait_duix_ready(timeout: float = 240.0) -> bool:
@@ -1509,24 +2134,25 @@ async def _dh_wait_duix_ready(timeout: float = 240.0) -> bool:
     while time.time() < deadline:
         if not _dh_enabled_now():
             return False
-        if await _dh_reachable():
+        if await _dh_all_reachable():
             return True
         await asyncio.sleep(3)
     return False
 
 
 async def _dh_container_start() -> None:
-    """启动 DUIX 容器并等它就绪；失败/超时只更新状态，不阻塞其它功能。"""
+    """启动全部 DUIX 容器并等它们就绪；失败/超时只更新状态，不阻塞其它功能。"""
     _dh_duix_set("starting", "正在启动 DUIX 容器…")
-    ok, out = await asyncio.to_thread(_docker, ["start", DH_CONTAINER], 120)
-    if not ok:
-        _dh_duix_set("unavailable", f"启动容器失败: {out[:160]}")
-        logger.warning("DH container start failed: %s", out)
-        return
-    logger.info("DH container starting (%s)…", DH_CONTAINER)
+    for name in DH_CONTAINERS:
+        ok, out = await asyncio.to_thread(_docker, ["start", name], 120)
+        if not ok:
+            _dh_duix_set("unavailable", f"启动容器失败({name}): {out[:160]}")
+            logger.warning("DH container start failed (%s): %s", name, out)
+            return
+        logger.info("DH container starting (%s)…", name)
     if await _dh_wait_duix_ready():
         _dh_duix_set("running", "DUIX 就绪")
-        logger.info("DH container ready at %s", DH_DUIX_BASE)
+        logger.info("DH container ready at %s", ", ".join(DH_DUIX_BASES))
     else:
         _dh_duix_set("unavailable", "DUIX 容器未在超时内就绪")
         logger.warning("DH container did not become ready in time")
@@ -1536,12 +2162,14 @@ async def _dh_bring_up() -> None:
     """打开数字人：确保容器在跑 → 真正就绪后再预热。"""
     if not _dh_enabled_now():
         return
-    if await _dh_reachable():
+    if await _dh_all_reachable():
         _dh_duix_set("running", "DUIX 就绪")
     else:
         await _dh_container_start()
     if _dh_enabled_now() and _dh_duix.get("state") == "running":
         await _dh_warmup()
+        # 预热跑完再渲染暖场动画：两者共用 DUIX，串起来才不会互相抢算力
+        await _ensure_warmup_videos()
 
 
 @app.on_event("startup")
@@ -1553,89 +2181,142 @@ async def _dh_start_worker() -> None:
         # 预热让 wenet 特征提取 / init_wh / 模型加载 / TRT engine 走一遍热路径，
         # 首条真实回复的等待时间显著缩短。预热独立于 _dh_queue，结果直接丢弃。
         asyncio.create_task(_dh_bring_up())
-        logger.info("DH worker started (DUIX %s, container=%s, temp=%s, avatar=%s, max_keep=%d)", DH_DUIX_BASE, DH_CONTAINER, DH_TEMP_DIR, DH_AVATAR, DH_MAX_KEEP)
+        # 暖场语音：启动时后台补齐（首次要跑一次 TTS，顺带把 TTS 路热起来）
+        if DH_WARMUP_ENABLED:
+            asyncio.create_task(_ensure_warmup())
+        logger.info(
+            "DH worker started (DUIX %s, container=%s, lanes=%d, temp=%s, avatar=%s, max_keep=%d)",
+            ", ".join(DH_DUIX_BASES), ", ".join(DH_CONTAINERS), len(DH_DUIX_BASES),
+            DH_TEMP_DIR, DH_AVATAR, DH_MAX_KEEP,
+        )
     else:
         logger.info("DH disabled — no worker, no warmup, zero DUIX traffic")
 
 
-async def _dh_warmup() -> None:
-    """后台预热：跑一次完整的「TTS → 特征 → init_wh → 生成」链路。
+async def _dh_warmup_one(base: str, wav_name: str) -> bool:
+    """预热单个 DUIX 实例：提交一次真实任务并等它跑完，成品直接删掉。
 
-    预热输出是「数字人没有说话」的占位短句（或仅预合成音频 + 提交），
-    完成即删，不进入播放列表、不污染 max_keep 历史。
-    DUIX 不可达时直接跳过（旧版会在这里对着空气重试 60×5s，是「关着数字人
-    还一直敲 DUIX」的元凶之一）。"""
+    单个实例的「第一次任务」要现场加载 netG / TRT 引擎（实测多花 ~40s），
+    多实例并行时必须逐个预热，否则第二段会迟到几十秒、播放卡顿。
+    预热不写 _dh_state，失败静默。
+
+    2026-10-21：预热也要让路。以前预热是独立 task 异步发的，用户首条回复
+    进来时预热可能还在跑，两个任务同实例并发 → 实测首段被拖到 35s。现在
+    拿不到串行锁就直接跳过预热（真实任务优先级更高，冷启动惩罚远比争用小）。
+    """
+    sem = _dh_lane_lock(base)
+    if sem.locked():
+        logger.info("DH warmup: %s lane in use by real task, skipping", base)
+        return False
+    async with sem:
+        return await _dh_warmup_one_impl(base, wav_name)
+
+
+async def _dh_warmup_one_impl(base: str, wav_name: str) -> bool:
+    code = f"warmup-{uuid4()}"
+    payload = {
+        "code": code,
+        "audio_url": wav_name,
+        "video_url": _persona_avatar(),
+        "watermark_switch": 0,
+        "digital_auth": 0,
+        "chaofen": 0,
+        "pn": 1,
+    }
+    fname = ""
+    async with httpx.AsyncClient(timeout=20) as client:
+        warm_fails = 0
+        for _ in range(60):  # 最多等 5 分钟 busy 释放
+            if not _dh_enabled_now():
+                return False
+            try:
+                resp = await _dh_submit(client, payload, base)
+            except Exception:  # noqa: BLE001
+                # DUIX 掉线：连续失败到阈值就放弃预热（旧版在这里闷头重试
+                # 5 分钟，每次都是一条连接尝试 → 日志/连接刷屏）
+                warm_fails += 1
+                if warm_fails >= DH_SUBMIT_CONN_FAILS:
+                    logger.warning("DH warmup: %s unreachable, skipping", base)
+                    return False
+                await asyncio.sleep(DH_SUBMIT_RETRY_SEC)
+                continue
+            warm_fails = 0
+            if resp.get("code") == 10000:
+                break
+            if resp.get("code") == 10001:  # busy（真实任务在跑，跳过预热）
+                logger.info("DH warmup: %s busy, skipping", base)
+                return False
+            await asyncio.sleep(DH_SUBMIT_RETRY_SEC)
+        else:
+            logger.warning("DH warmup: %s busy too long, skipping", base)
+            return False
+        deadline = time.time() + 240
+        while time.time() < deadline:
+            await asyncio.sleep(DH_QUERY_INTERVAL)
+            try:
+                data = await _dh_query(client, code, base)
+            except Exception:  # noqa: BLE001
+                continue
+            if not data:
+                continue
+            status = str(data.get("status"))
+            if status in ("2", "success", "s", "done", "finished", "成功"):
+                fname = str(data.get("result") or "").rsplit("/", 1)[-1]
+                break
+    if fname:
+        # 挪到 output 子目录再删（保持 temp 根只有形象素材）
+        moved = _dh_move_to_output(DH_TEMP_DIR / fname)
+        if moved is not None:
+            (DH_OUTPUT_DIR / moved).unlink(missing_ok=True)
+    return bool(fname)
+
+
+async def _dh_warmup() -> None:
+    """后台预热：对每个 DUIX 实例跑一次「TTS → 特征 → init_wh → 生成」链路。
+
+    预热输出是占位短句，完成即删，不进入播放列表、不污染 max_keep 历史。
+    实例不可达时跳过（旧版会对着空气重试 60×5s，是「关着数字人还一直敲
+    DUIX」的元凶之一）。"""
+    wav: Path | None = None
     try:
         if not _dh_enabled_now():
             return
-        if not await _dh_reachable():
-            logger.info("DH warmup skipped: DUIX unreachable at %s", DH_DUIX_BASE)
+        live: list[str] = []
+        for base in DH_DUIX_BASES:
+            if await _dh_reachable(base=base):
+                live.append(base)
+        if not live:
+            logger.info("DH warmup skipped: DUIX unreachable at %s", ", ".join(DH_DUIX_BASES))
             return
-        logger.info("DH warmup: synthesizing warmup audio…")
+        rounds = max(1, DH_WARMUP_ROUNDS)
+        logger.info(
+            "DH warmup: synthesizing warmup audio… (%d instance(s) × %d round(s))",
+            len(live), rounds,
+        )
         wav = await _dh_synth_segment("数字人系统预热完成")
-        code = f"warmup-{uuid4()}"
-        payload = {
-            "code": code,
-            "audio_url": wav.name,
-            "video_url": _persona_avatar(),
-            "watermark_switch": 0,
-            "digital_auth": 0,
-            "chaofen": 0,
-            "pn": 1,
-        }
-        async with httpx.AsyncClient(timeout=20) as client:
-            # 预热不写 _dh_state：直接提交 + 轮询，完成即删，失败静默。
-            warm_fails = 0
-            for _ in range(60):  # 最多等 5 分钟 busy 释放
+
+        async def _warm_rounds(base: str) -> int:
+            """同一实例连续预热 rounds 轮（每轮可能落到不同的 worker 进程）。"""
+            done = 0
+            for _ in range(rounds):
                 if not _dh_enabled_now():
-                    logger.info("DH warmup: aborted (switched off)")
-                    wav.unlink(missing_ok=True)
-                    return
-                try:
-                    resp = await _dh_submit(client, payload)
-                except Exception:  # noqa: BLE001
-                    # DUIX 掉线：连续失败到阈值就放弃预热（旧版在这里闷头重试
-                    # 5 分钟，每次都是一条到 :9000 的连接尝试 → 日志/连接刷屏）
-                    warm_fails += 1
-                    if warm_fails >= DH_SUBMIT_CONN_FAILS:
-                        logger.warning("DH warmup: DUIX unreachable, skipping warmup")
-                        wav.unlink(missing_ok=True)
-                        return
-                    await asyncio.sleep(DH_SUBMIT_RETRY_SEC)
-                    continue
-                warm_fails = 0
-                if resp.get("code") == 10000:
                     break
-                if resp.get("code") == 10001:  # busy（真实任务在跑，跳过预热）
-                    logger.info("DH warmup: DUIX busy, skipping warmup")
-                    wav.unlink(missing_ok=True)
-                    return
-                await asyncio.sleep(DH_SUBMIT_RETRY_SEC)
-            else:
-                logger.warning("DH warmup: DUIX busy too long, skipping")
-                wav.unlink(missing_ok=True)
-                return
-            deadline = time.time() + 120
-            fname = ""
-            while time.time() < deadline:
-                await asyncio.sleep(DH_QUERY_INTERVAL)
-                q = await _dh_query(client, code)
-                if q is None:
-                    continue
-                status = str(q.get("status"))
-                if status in ("2", "success", "s", "done", "finished", "成功"):
-                    fname = str(q.get("result") or "").rsplit("/", 1)[-1]
-                    break
-            host = DH_TEMP_DIR / fname if fname else None
-            if host is not None:
-                # 挪到 output 子目录再删（保持 temp 根只有形象素材）
-                moved = _dh_move_to_output(host)
-                if moved is not None:
-                    (DH_OUTPUT_DIR / moved).unlink(missing_ok=True)
-            wav.unlink(missing_ok=True)
-            logger.info("DH warmup: done (prewarmed TTS/wenet/DUIX)%s", f" {fname} cleaned" if fname else "")
+                if not await _dh_warmup_one(base, wav.name):
+                    break  # 被真实任务占用（让路）或预热失败，不再占坑
+                done += 1
+            return done
+
+        outs = await asyncio.gather(*(_warm_rounds(b) for b in live), return_exceptions=True)
+        ok = sum(o for o in outs if isinstance(o, int))
+        logger.info(
+            "DH warmup: done %d/%d round(s) over %d instance(s) (prewarmed TTS/wenet/DUIX)",
+            ok, rounds * len(live), len(live),
+        )
     except Exception:  # noqa: BLE001
         logger.exception("DH warmup failed (non-fatal)")
+    finally:
+        if wav is not None:
+            wav.unlink(missing_ok=True)
 
 
 # 结果视频静态挂载：插件 video 元素直接播 /media/dh/<uuid>-r.mp4（Range 支持）。
@@ -1645,6 +2326,14 @@ async def _dh_warmup() -> None:
 if DH_TEMP_DIR.is_dir():
     DH_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     app.mount("/media/dh", StaticFiles(directory=str(DH_OUTPUT_DIR)), name="media-dh")
+
+# 暖场音频静态挂载（预生成的 wav，前端 <audio> 直接播）：目录可能还不存在
+# （首次启动尚未合成），先建空目录再挂，避免这里 404 掉整批暖场。
+try:
+    DH_WARMUP_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount("/media/warmup", StaticFiles(directory=str(DH_WARMUP_DIR)), name="media-warmup")
+except Exception:  # noqa: BLE001
+    logger.exception("warmup static mount failed (filler voice disabled)")
 
 
 # ── 人设/预设切换（音色 + 数字人形象 + 待机动画，三类独立）─────────────────
@@ -1723,6 +2412,10 @@ async def persona_set(req: PersonaSetRequest) -> dict:
         # 音色与形象完全独立：切音色不影响当前形象选择。
         result["voice"] = name
         logger.info("voice switched to %s", name)
+        # 暖场语音是按音色分目录缓存的：换音色后必须重新合成，否则「嗯…」
+        # 还是上一个人的嗓子，比没有暖场更出戏。
+        if DH_WARMUP_ENABLED:
+            asyncio.create_task(_ensure_warmup(name))
 
     # 形象切换
     if req.avatar is not None:
@@ -1732,6 +2425,14 @@ async def persona_set(req: PersonaSetRequest) -> dict:
         _avatar_override = av
         result["avatar"] = av
         logger.info("avatar switched to %s", av)
+        # 暖场动画是用「旧形象」渲染的：不重渲就会出现暖场里说话的是上一个人。
+        # 删掉 mp4（保留 wav）再后台重渲，期间前端自动回退到「有声无口型」。
+        if DH_WARMUP_ENABLED:
+            folder = DH_WARMUP_DIR / _warmup_safe_name(_current_persona)
+            if folder.is_dir():
+                for old_clip in folder.glob("*.mp4"):
+                    old_clip.unlink(missing_ok=True)
+            asyncio.create_task(_ensure_warmup_videos())
 
     # 待机动画切换
     if req.idle is not None:

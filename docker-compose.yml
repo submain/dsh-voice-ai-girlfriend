@@ -101,7 +101,7 @@ services:
   # 原样迁自 bridge/docker-compose-5060ti.yml（RTX 50 系适配版），改动仅：
   #   - 加入 ai_network（与 voice-bridge 互通，桥接走服务名 :8383 访问）
   #   - TTS/ASR 仍由 voice-bridge 负责（镜像已精简，无重复模型）
-  duix-avatar-gen-video:
+  duix-avatar-gen-video: &duix
     image: guiji2025/duix.avatar-5090:trt10.9
     container_name: duix-avatar-gen-video
     restart: always
@@ -148,6 +148,55 @@ services:
 
     networks:
       - ai_network
+
+  # ==================== DSH Web（浏览器前端 + 语音插件） ====================
+  # 镜像由 harness 源码树构建（容器内 pnpm install + build，宿主 Windows 的
+  # node_modules 是符号链接无法复用）。语音插件通过 dsh plugin 机制装进
+  # /root/.dsh/profiles/web，不污染源码树。
+  # 浏览器侧插件直接访问宿主 127.0.0.1:8765（桥接），故容器无需连 ai_network。
+  dsh-web:
+    build:
+      context: ${DSH_HARNESS_DIR:-D:/kaiyuan/deepseek-harness}
+      dockerfile: Dockerfile.dsh-web
+    image: dsh-web:latest
+    container_name: dsh-web
+    restart: unless-stopped
+
+    environment:
+      # LLM 上游：Qwen3.8-27B（远端 vLLM，OpenAI 兼容）
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-http://192.168.2.218:11435/v1}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-EMPTY}
+      # llm-pi-ai 自定义 provider 的凭据（settings.yaml 里 apiKeyEnv 指向它；vLLM 不校验值）
+      - QWEN_API_KEY=${QWEN_API_KEY:-EMPTY}
+      - NODE_OPTIONS=--max-old-space-size=4096
+
+    ports:
+      # dsh 只允许绑定 127.0.0.1，容器内 socat 把 3081 转发到 3080；
+      # 宿主仍用熟悉 http://127.0.0.1:3080 访问
+      - "127.0.0.1:3080:3081"
+
+    volumes:
+      # 会话/设置持久化（只挂数据子目录，保留镜像内已装的 profiles/插件）
+      - ./runtime/dsh-home/sessions:/root/.dsh/sessions
+      - ./runtime/dsh-home/storages:/root/.dsh/storages
+      # LLM provider 配置（Qwen vLLM 路由 + 默认模型）
+      - ./runtime/dsh-home/settings.yaml:/root/.dsh/settings.yaml
+      # 语音插件构建产物（含「思考模式」开关）。挂整个 lib 目录覆盖镜像里
+      # github 装进来的那份，重建镜像后依然生效；源码与构建见 dsh-plugin/。
+      - ./runtime/dsh-plugin-lib:/root/.dsh/profiles/web/node_modules/@beiyege-01/dsh-voice-ai-girlfriend/lib
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3081/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   # ==================== NapCat QQ（可选，--profile qq 启用） ====================
   # docker compose --profile qq up -d

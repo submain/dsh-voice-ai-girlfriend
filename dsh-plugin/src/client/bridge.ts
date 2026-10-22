@@ -82,6 +82,40 @@ export interface DhStatus {
 }
 
 /**
+ * Filler ("暖场") audio shipped with a submission: pre-synthesized short
+ * utterances in the CURRENT voice. `open` plays the instant a reply is
+ * accepted (the digital human takes tens of seconds to produce its first
+ * frame, and silence reads as "disconnected"); `mid` fills the gap whenever
+ * the playback queue runs dry while more segments are still rendering.
+ */
+export interface DhWarmupItem {
+  /** Spoken filler (always present once synthesized). */
+  audio: string
+  /** Lip-synced clip rendered offline by DUIX; null until that finishes. */
+  video: string | null
+}
+
+export interface DhWarmup {
+  open: DhWarmupItem[]
+  mid: DhWarmupItem[]
+  max_mid?: number
+}
+
+let warmupListener: ((warmup: DhWarmup) => void) | null = null
+
+/**
+ * Subscribe to the warmup bundle of every accepted submission. Single
+ * consumer by design: the companion window owns audio playback.
+ * Returns an unsubscribe function.
+ */
+export function onDhWarmup(cb: (warmup: DhWarmup) => void): () => void {
+  warmupListener = cb
+  return () => {
+    if (warmupListener === cb) warmupListener = null
+  }
+}
+
+/**
  * Digital human: submit a finished reply text so the bridge synthesizes it
  * with the same TTS voice and renders a lip-synced talking-head video (DUIX).
  * Resolves with the task code (null on failure); the latest submission
@@ -100,7 +134,10 @@ export function dhSpeak(text: string): Promise<string | null> {
         const b = await resp.text().catch(() => '')
         throw new Error(`/api/dh/speak failed: ${resp.status} ${b}`.trim())
       }
-      const json = (await resp.json()) as { code?: string }
+      const json = (await resp.json()) as { code?: string; warmup?: DhWarmup }
+      // Hand the filler audio to the player BEFORE returning: the whole point
+      // is to be heard immediately, not after the first video segment lands.
+      if (json.warmup !== undefined) warmupListener?.(json.warmup)
       return json.code ?? null
     })
     .catch((err) => {
