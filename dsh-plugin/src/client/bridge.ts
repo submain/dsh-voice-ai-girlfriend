@@ -79,6 +79,8 @@ export interface DhStatus {
   text: string
   pending: number
   updated_at: number
+  /** 首段「提交 → 出片」的预计秒数：暖场按它决定铺多长。 */
+  est_wait?: number
 }
 
 /**
@@ -93,6 +95,8 @@ export interface DhWarmupItem {
   audio: string
   /** Lip-synced clip rendered offline by DUIX; null until that finishes. */
   video: string | null
+  /** Clip length in seconds — used to fill exactly until the real video lands. */
+  sec?: number
 }
 
 export interface DhWarmup {
@@ -123,6 +127,8 @@ export interface DhWarmupPick {
   open: DhWarmupItem
   mid: DhWarmupItem[]
   max_mid: number
+  /** 首段预计等待（秒）：暖场铺多长按它算。 */
+  est_wait: number
 }
 
 let pickListener: ((pick: DhWarmupPick) => void) | null = null
@@ -135,6 +141,34 @@ export function onDhWarmupPick(cb: (pick: DhWarmupPick) => void): () => void {
   }
 }
 
+let userSpokeListener: (() => void) | null = null
+
+/**
+ * Fired the INSTANT a new user turn appears — BEFORE the picker round-trip.
+ * The player uses it to start a filler immediately (with the previous turn's
+ * scene and the measured wait estimate), so the gap is filled in ~0 ms instead
+ * of waiting for the network. The picker result then only refines the plan.
+ */
+export function onUserSpoke(cb: () => void): () => void {
+  userSpokeListener = cb
+  return () => {
+    if (userSpokeListener === cb) userSpokeListener = null
+  }
+}
+
+/** Warmup manifest for the current voice (no LLM involved; cached on the bridge). */
+export async function dhWarmupManifest(): Promise<DhWarmup | null> {
+  try {
+    const resp = await fetch(`${bridgeBase()}/api/dh/warmup`)
+    if (!resp.ok) return null
+    const json = (await resp.json()) as { open?: DhWarmupItem[]; mid?: DhWarmupItem[]; max_mid?: number }
+    if (!json.open || !json.mid || json.open.length === 0) return null
+    return { open: json.open, mid: json.mid, max_mid: json.max_mid }
+  } catch {
+    return null
+  }
+}
+
 /**
  * Ask the bridge to pick fillers for ONE user turn — fired the moment the user
  * stops talking, IN PARALLEL with the real answer. The request only makes the
@@ -142,6 +176,8 @@ export function onDhWarmupPick(cb: (pick: DhWarmupPick) => void): () => void {
  * away, so this latency is free.
  */
 export async function dhPickWarmup(text: string): Promise<DhWarmupPick | null> {
+  // 先让播放端立刻开口（用上一轮的场景 + 实测等待长度），不等网络
+  userSpokeListener?.()
   try {
     const resp = await fetch(`${bridgeBase()}/api/dh/warmup/pick`, {
       method: 'POST',
@@ -181,30 +217,57 @@ export function reportWarmup(result: {
   })
 }
 
+/** Result of one /api/dh/speak call (submit or stream append). */
+export interface DhSpeakResult {
+  ok?: boolean
+  code?: string
+  /** append 失败原因：'gone' = 原任务已结束（调用方应开新任务）。 */
+  reason?: string
+  warmup?: DhWarmup
+  total_segments?: number
+}
+
 /**
- * Digital human: submit a finished reply text so the bridge synthesizes it
- * with the same TTS voice and renders a lip-synced talking-head video (DUIX).
- * Resolves with the task code (null on failure); the latest submission
- * replaces any not-yet-started one in the bridge queue.
+ * Digital human: feed reply text to the bridge, which synthesizes it with the
+ * same TTS voice and renders a lip-synced talking-head video (DUIX).
+ *
+ * Two modes:
+ * - submit (`append: false`): a new task; the latest submission replaces any
+ *   not-yet-started one in the bridge queue.
+ * - append (`append: true`, with the task `code`): stream the rest of the
+ *   reply into the RUNNING task. This is what removes the perceived gap — the
+ *   model is still typing while DUIX already renders the first sentences.
+ *
+ * `done: true` says "no more text for this reply", letting the bridge finish
+ * the task instead of waiting for the next append.
  */
-export function dhSpeak(text: string): Promise<string | null> {
+export function dhSpeak(
+  text: string,
+  opts?: { append?: boolean; done?: boolean; code?: string | null },
+): Promise<DhSpeakResult | null> {
   const body = (text || '').trim()
-  if (!body) return Promise.resolve(null)
+  const append = opts?.append === true
+  if (!append && !body) return Promise.resolve(null)
   return fetch(`${bridgeBase()}/api/dh/speak`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: body }),
+    body: JSON.stringify({
+      text: body,
+      append,
+      done: opts?.done === true,
+      code: opts?.code ?? '',
+    }),
   })
     .then(async (resp) => {
       if (!resp.ok) {
         const b = await resp.text().catch(() => '')
         throw new Error(`/api/dh/speak failed: ${resp.status} ${b}`.trim())
       }
-      const json = (await resp.json()) as { code?: string; warmup?: DhWarmup }
+      const json = (await resp.json()) as DhSpeakResult
       // Hand the filler audio to the player BEFORE returning: the whole point
       // is to be heard immediately, not after the first video segment lands.
       if (json.warmup !== undefined) warmupListener?.(json.warmup)
-      return json.code ?? null
+      return json
     })
     .catch((err) => {
       console.error('[ui-voice] digital human submit failed:', err)

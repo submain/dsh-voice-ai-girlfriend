@@ -186,7 +186,10 @@ services:
       - ./runtime/dsh-plugin-lib:/root/.dsh/profiles/web/node_modules/@beiyege-01/dsh-voice-ai-girlfriend/lib
 
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3081/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      # dsh 需要 ?token=... 鉴权，未带 token 的请求固定返回 401。401/403
+      # 说明 HTTP 栈已就绪（旧写法 r.ok 会把 401 判为失败，导致永远 unhealthy），
+      # 故只把 5xx / 连不上视为不健康。
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3081/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 5

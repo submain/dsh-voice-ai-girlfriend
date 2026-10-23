@@ -26,7 +26,7 @@ import type { CSSProperties } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: pulls ui-conversation's SlotMap merge for PropsRuntime resolution.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { bridgeBase, dhStatus, dhDiscard, onDhWarmup, onDhWarmupPick, reportWarmup, tts, readVoiceEnabled, type DhStatus, type DhWarmup } from '../bridge.ts'
+import { bridgeBase, dhStatus, dhDiscard, onDhWarmup, onDhWarmupPick, onUserSpoke, dhWarmupManifest, reportWarmup, tts, readVoiceEnabled, type DhStatus, type DhWarmup } from '../bridge.ts'
 import { readDigitalHuman } from '../DigitalHumanToggle.tsx'
 import type { VoiceInjected } from '../contract.ts'
 import css from './CompanionWindow.module.css'
@@ -131,6 +131,30 @@ interface BgMedia {
 /** Full props: framework runtime share + `voice` locale seat + injected face. */
 export type CompanionWindowProps =
   PropsRuntime<'conversation.input.left'> & PropsLocale<'voice'> & VoiceInjected
+
+/**
+ * 数字人/暖场片段的播放速率。
+ *
+ * 为什么在「播放端」放慢而不是让 TTS 生成得更慢：DUIX 每段的耗时 ≈ 固定开销
+ * + 与视频时长成正比，TTS 生成慢 10% 就等于视频长 10%、生成也慢 10%，首段
+ * 反而更晚。而在播放端用 playbackRate 放慢，生成成本一分不涨，播放时间却
+ * 变长——既满足「语速慢一点」，也让后续段更容易追上播放进度。
+ *
+ * 注意：只对音画一体的片段整体放慢，口型仍然同步；但低于 0.85 会有明显
+ * 慢动作感。改法：localStorage.setItem('s2s.voice.rate', '0.95') 后刷新。
+ */
+const PLAY_RATE_KEY = 's2s.voice.rate'
+const PLAY_RATE_DEFAULT = 0.9
+
+function playRate(): number {
+  try {
+    const raw = Number(localStorage.getItem(PLAY_RATE_KEY))
+    if (Number.isFinite(raw) && raw >= 0.7 && raw <= 1.05) return raw
+  } catch {
+    // localStorage 不可用：用默认值
+  }
+  return PLAY_RATE_DEFAULT
+}
 
 /** Inline base for every video layer: absolute, fill the card, crossfade via opacity. */
 const VIDEO_STYLE: CSSProperties = {
@@ -268,14 +292,29 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
   const warmFrontRef = useRef(0)
   const warmRef = useRef<HTMLAudioElement | null>(null)
   const warmupRef = useRef<DhWarmup | null>(null)
-  const warmMidCountRef = useRef(0)
-  const warmMidAtRef = useRef(0)
   const warmLastOpenRef = useRef(0)
   const warmLastIdxRef = useRef<{ open: number; mid: number }>({ open: -1, mid: -1 })
   // When the LLM picker already spoke the opener for this turn (it fires the
   // moment the user stops talking), the later dhSpeak warmup bundle must not
   // say "嗯…" a second time.
   const warmPickAtRef = useRef(0)
+  // 首段预计等待（桥接按实测滑动平均给出）：暖场要铺满这段时间，
+  // 否则「播两句就干等」。
+  const estWaitRef = useRef(18)
+  // 预算余量：桥接给的 est_wait 是「提交 → 首段出片」，而暖场是从「用户说完」
+  // 就开始铺的，中间还差 LLM 吐出第一句的时间（按句流式提交，实测 1~3s）。
+  // 少铺这一段就等于末尾干等，而多铺只是多「嗯」一声（正片一到立刻接上），
+  // 所以统一加一点余量，宁多勿少。
+  const WARM_SLACK_SEC = 3
+  const warmBudgetRef = useRef(18)
+  const warmPlayedRef = useRef(0)
+  // 暖场这一句是否还在播（含正在加载）。正片就绪时若它还没说完，就等它——
+  // 视频已经生成好了，晚两秒开播不亏，硬切才是真的不自然。
+  const warmActiveRef = useRef(false)
+  const dhWaitWarmRef = useRef(false) // 有正片在排队等暖场说完
+  const warmWaitTimerRef = useRef(0)
+  // playNextDh 定义在后面，兜底定时器里要回调它
+  const playNextDhRef = useRef<(() => void) | null>(null)
 
   // Drag-move state.
   const moveRef = useRef<{ startX: number; startY: number; base: { x: number; y: number } } | null>(null)
@@ -539,12 +578,16 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
     }
   }, [])
 
-  /** Pause + hide every layer of a pair (reset / stop path). */
-  const resetLayers = useCallback((layers: Array<HTMLVideoElement | null>): void => {
+  /** Pause + hide every layer of a pair.
+   *
+   * `rewind: false` keeps the current frame while the 0.16s fade-out runs —
+   * jumping currentTime back to 0 first would show the clip's FIRST frame for
+   * a blink, which is exactly the visual "jump" between clips. */
+  const resetLayers = useCallback((layers: Array<HTMLVideoElement | null>, rewind = false): void => {
     for (const el of layers) {
       if (el === null) continue
       el.pause()
-      el.currentTime = 0
+      if (rewind) el.currentTime = 0
       el.style.opacity = '0'
     }
   }, [])
@@ -562,6 +605,7 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       frontRef: { current: number },
       src: string,
       playEl?: (el: HTMLVideoElement) => void,
+      onShown?: () => void,
     ): boolean => {
       const next = 1 - frontRef.current
       const to = layers[next]
@@ -578,10 +622,13 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
         if (swapped) return
         swapped = true
         frontRef.current = next
+        // load() 会把 playbackRate 重置成 defaultPlaybackRate，所以每次换片都重设
+        to.playbackRate = playRate()
         to.style.opacity = '1'
         if (from !== null) from.style.opacity = '0'
         if (playEl !== undefined) playEl(to)
         else void to.play().catch(() => {})
+        onShown?.()
         if (from !== null) {
           window.setTimeout(() => {
             if (frontRef.current !== next) return
@@ -613,6 +660,9 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
   /** Silence both filler layers (a real segment is taking over, or we stop). */
   const stopWarmup = useCallback(() => {
     resetLayers(warmLayersRef.current)
+    warmActiveRef.current = false
+    dhWaitWarmRef.current = false
+    window.clearTimeout(warmWaitTimerRef.current)
     const audio = warmRef.current
     if (audio !== null) {
       audio.pause()
@@ -620,12 +670,26 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
     }
   }, [resetLayers])
 
-  const stopDh = useCallback(() => {
+  /** 只清数字人层，保留正在播的暖场：新一轮任务码到达时暖场必须播完。 */
+  const stopDhVideo = useCallback(() => {
     dhHoldingRef.current = false
-    resetLayers(dhLayersRef.current)
-    stopWarmup()
+    resetLayers(dhLayersRef.current, true)
     setDhPlayingBoth(false)
-  }, [resetLayers, setDhPlayingBoth, stopWarmup])
+  }, [resetLayers])
+
+  const stopDh = useCallback(() => {
+    stopDhVideo()
+    stopWarmup()
+  }, [stopDhVideo, stopWarmup])
+
+  /** 暖场是否真的已经在出声。还在加载（没起播）的那条不值得让正片等。 */
+  const warmSpeakingNow = useCallback((): boolean => {
+    for (const el of warmLayersRef.current) {
+      if (el !== null && !el.paused && el.currentTime > 0) return true
+    }
+    const audio = warmRef.current
+    return audio !== null && !audio.paused && audio.currentTime > 0
+  }, [])
 
   /** Start a filler media element and REPORT what the browser did with it.
    *
@@ -675,6 +739,21 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
     warmLastIdxRef.current[kind] = pick
     const item = list[pick]
     if (item === undefined) return false
+    // 累加已铺时长（按放慢后的实际播放时长算）：接力时按它和预算决定还要不要补
+    const playSec = (item.sec ?? 2) / playRate()
+    warmPlayedRef.current += playSec
+    // 标记「暖场在播」：正片到了要等这句说完，而不是硬切
+    warmActiveRef.current = true
+    window.clearTimeout(warmWaitTimerRef.current)
+    // 兜底：该播完却收不到 ended（解码失败/被浏览器拦）时，别把正片永远挂着
+    warmWaitTimerRef.current = window.setTimeout(() => {
+      if (!warmActiveRef.current) return
+      warmActiveRef.current = false
+      if (dhWaitWarmRef.current) {
+        dhWaitWarmRef.current = false
+        playNextDhRef.current?.()
+      }
+    }, (playSec + 1.5) * 1000)
     const base = bridgeBase()
     if (item.video !== null) {
       const shown = showClip(warmLayersRef.current, warmFrontRef, `${base}${item.video}`, (el) => {
@@ -693,21 +772,46 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
   // segment is ten-plus seconds away, and total silence reads as "disconnected".
   // Any leftover segment from the previous reply is cut first so the two audio
   // tracks never overlap.
+  // 用户刚说完 → 立刻开口，不等任何网络往返。
+  // 用上一轮的场景 + 实测等待长度先铺上，pick 回来只做精修。
   useEffect(() => {
-    return onDhWarmupPick((pick) => {
-      // 用户刚说完，桥接挑好了一组暖场（模型优先、规则兜底）：立刻开口。
-      // 这条路径比 dhSpeak 早得多——不用等回复生成完。
-      warmupRef.current = { open: [pick.open], mid: pick.mid, max_mid: pick.max_mid }
-      warmMidCountRef.current = 0
-      warmMidAtRef.current = 0
+    return onUserSpoke(() => {
+      if (!readDigitalHuman()) return
+      if (warmupRef.current === null) return // 清单还没到手，等 pick 那次
+      stopDhVideo()
+      warmPlayedRef.current = 0
+      warmBudgetRef.current = estWaitRef.current
       dhPendingRef.current = true
       warmPickAtRef.current = Date.now()
       warmLastOpenRef.current = Date.now()
-      if (!readDigitalHuman()) return
-      stopDh()
       playWarmup('open')
     })
-  }, [playWarmup, stopDh])
+  }, [playWarmup, stopDhVideo])
+
+  useEffect(() => {
+    return onDhWarmupPick((pick) => {
+      // 场景与预算以这次为准（模型判断更贴合，est_wait 是实测滑动平均）
+      warmupRef.current = { open: [pick.open], mid: pick.mid, max_mid: pick.max_mid }
+      estWaitRef.current = pick.est_wait ? pick.est_wait + WARM_SLACK_SEC : estWaitRef.current
+      warmBudgetRef.current = Math.max(warmPlayedRef.current + 3, estWaitRef.current)
+      dhPendingRef.current = true
+      if (!readDigitalHuman()) return
+      // 开场已经由 onUserSpoke 发出去了：这里只更新后面的垫场
+      if (warmPlayedRef.current > 0) return
+      stopDhVideo()
+      warmPickAtRef.current = Date.now()
+      warmLastOpenRef.current = Date.now()
+      playWarmup('open')
+    })
+  }, [playWarmup, stopDhVideo])
+
+  // 清单预热：第一轮对话时 onUserSpoke 才不会因为没清单而哑火
+  useEffect(() => {
+    if (warmupRef.current !== null) return
+    void dhWarmupManifest().then((manifest) => {
+      if (manifest !== null && warmupRef.current === null) warmupRef.current = manifest
+    })
+  }, [])
 
   // A reply was accepted by the bridge: speak up IMMEDIATELY. The first video
   // segment is ten-plus seconds away, and total silence reads as "disconnected".
@@ -719,12 +823,12 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       // 这一轮的开场已经由 pick 播过了（用户说完就发起的那次）：只更新清单，
       // 别再「嗯」一次，也别把正在播的画面掐掉。
       if (Date.now() - warmPickAtRef.current < 30000) return
-      warmMidCountRef.current = 0
-      warmMidAtRef.current = 0
+      warmPlayedRef.current = 0
+      warmBudgetRef.current = estWaitRef.current
       // 受理即视为「还在生成」：状态轮询要 4s 才跟上，暖场续接不能等它
       dhPendingRef.current = true
       if (!readDigitalHuman()) return
-      stopDh()
+      stopDhVideo()
       // 一个用户回合可能提交两次（先 first 段、4s 后再 last 段）。第二次
       // 不该再「嗯，我看看啊」一次——同一回合里开场暖场只出声一遍。
       const now = Date.now()
@@ -735,16 +839,11 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
     })
   }, [playWarmup, stopDh])
 
-  /** Queue ran dry mid-reply: fill the gap with one filler line (rate-limited). */
+  /** Queue ran dry mid-reply: keep filling until the budget (est. wait) is spent. */
   const maybeMidWarmup = useCallback((): boolean => {
-    const max = warmupRef.current?.max_mid ?? 3
-    if (warmMidCountRef.current >= max) return false
-    const now = Date.now()
-    if (now - warmMidAtRef.current < 1500) return false
-    if (!playWarmup('mid')) return false
-    warmMidCountRef.current += 1
-    warmMidAtRef.current = now
-    return true
+    if (warmupRef.current === null) return false
+    if (warmPlayedRef.current >= warmBudgetRef.current) return false
+    return playWarmup('mid')
   }, [playWarmup])
 
   // 用户占用麦克风/说话（interruptReply）：停止数字人视频播放。
@@ -766,12 +865,21 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       setDhPlayingBoth(false)
       return
     }
-    // 正片到了：暖场必须立刻闭嘴（它是占位用的，绝不能盖住真实语音）
-    stopWarmup()
+    // 暖场还没说完就先排队：视频已经生成好了，晚一两秒开播不亏，
+    // 在半句话上硬切才是不自然的那一下。
+    if (warmActiveRef.current && warmSpeakingNow()) {
+      dhWaitWarmRef.current = true
+      return
+    }
     // 先置「在播」，避免 4s 轮询在换层期间又调一次 playNextDh 把画面打乱
     setDhPlayingBoth(true)
-    showClip(dhLayersRef.current, dhFrontRef, next)
-  }, [setDhPlayingBoth, showClip, stopWarmup])
+    // 正片就绪（换层完成）之后再收暖场：反过来做的话，暖场先淡出、正片还在
+    // 解码，中间会露出背景 —— 那就是「衔接闪一下」的另一半原因。
+    const shown = showClip(dhLayersRef.current, dhFrontRef, next, undefined, stopWarmup)
+    if (!shown) stopWarmup()
+  }, [setDhPlayingBoth, showClip, stopWarmup, warmSpeakingNow])
+
+  playNextDhRef.current = playNextDh
 
   const driveDh = (status: DhStatus): void => {
     const code = status.code
@@ -786,11 +894,15 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       dhQueueRef.current = []
       dhQueuePlayedRef.current = 0
       handledDhRef.current.delete(code)
-      stopDh()
+      // 只清数字人层：暖场是独立一层，正在播的那句要让它播完
+      // （之前这里整层清掉，暖场说到一半就断——「声音没播完就卡住」）
+      stopDhVideo()
     }
     if (handledDhRef.current.has(code)) return
     // 桥接是否还在往下出段（决定播空时是停帧等，还是收尾回待机）
     dhPendingRef.current = status.state === 'tts' || status.state === 'generating'
+    // 首段等待的实测估计：暖场铺多长按它算（桥接侧是最近几次的滑动平均）
+    if (typeof status.est_wait === 'number' && status.est_wait > 0) estWaitRef.current = status.est_wait + WARM_SLACK_SEC
     if (status.state === 'discarded') {
       handledDhRef.current.add(code)
       waitingDhRef.current = null
@@ -878,6 +990,9 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       // 同时补一句暖场语音——画面停住 + 有声音，才像「在想」而不是卡死。
       dhHoldingRef.current = true
       vid.pause()
+      // 段间空档重新开一轮预算：由 onWarmEnded 接力铺到下一段到达
+      warmPlayedRef.current = 0
+      warmBudgetRef.current = Math.min(estWaitRef.current, 12)
       maybeMidWarmup()
       return
     }
@@ -886,16 +1001,27 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
     stopWarmup()  // 整条回复播完：暖场那帧也收掉，回到待机动画
   }, [playNextDh, setDhPlayingBoth, maybeMidWarmup, stopWarmup, resetLayers])
 
-  /** A filler line finished but we are still waiting: top it up (bounded). */
+  /** A filler line finished: 立刻接下一句，一直铺到预算用完或正片到达。
+   *
+   * 之前这里等 2.5 秒才补，且最多 3 句——首段要 20 秒的话，播 6 秒就干等
+   * 14 秒，用户体感就是「说两句然后卡住」。现在按 est_wait 铺满。 */
   const onWarmEnded = useCallback(() => {
+    warmActiveRef.current = false
+    window.clearTimeout(warmWaitTimerRef.current)
+    // 正片一直在排队等这句说完 → 现在切，不再接力垫场
+    if (dhWaitWarmRef.current) {
+      dhWaitWarmRef.current = false
+      playNextDh()
+      return
+    }
     if (!dhPendingRef.current) return
     window.setTimeout(() => {
       if (!dhPendingRef.current) return
       // ① 段间等待（画面停帧）或 ② 首段还没到（队列空、一段都没播过）
       const waitingFirst = dhQueuePlayedRef.current === 0 && dhQueueRef.current.length === 0
       if (dhHoldingRef.current || waitingFirst) maybeMidWarmup()
-    }, 2500)
-  }, [maybeMidWarmup])
+    }, 120)
+  }, [maybeMidWarmup, playNextDh])
 
   // ── Drag to reposition ────────────────────────────────────────────────────
   const beginMove = useCallback((clientX: number, clientY: number) => {

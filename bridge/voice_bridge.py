@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import wave
 import shutil
 import subprocess
 import threading
@@ -764,6 +765,18 @@ DH_FIRST_SEGMENT_CHARS = int(DH_CFG.get("first_segment_chars", 24))
 DH_FIRST_SEGMENT_MIN_CHARS = int(DH_CFG.get("first_segment_min_chars", 10))
 DH_MAX_TEXT = 1000
 
+# ── 流式喂料（2026-10-23：把「等 LLM 吐完」从空档里抠掉）────────────────────
+# 以前必须等整条回复 settled 才提交 DUIX：用户说完 → 等 LLM 吐完（实测 1000
+# 字要 37s）→ 再等首段 10~15s，这几十秒全靠暖场「嗯…」顶着，一听就是卡。
+# 现在插件按句把**已经完成的文本**追加进来（append=true），DUIX 一边渲染
+# 一边等后续，LLM 的吐字时间与视频渲染完全重叠。
+# 追加时的切段下限：太短的段要付整段固定开销（实测 ~10s），却只播几秒，
+# 播放端必然空转。所以攒够 segment_min_chars 再切（只在句末标点处切）。
+DH_APPEND_MIN_CHARS = int(DH_CFG.get("append_min_chars", DH_SEGMENT_MIN_CHARS))
+# 等后续文本的空闲上限：插件崩了 / 页面切走没发 done 时，别让任务永远挂着
+# （worker 是串行的，挂着会把后面的回复一起拖住）。
+DH_FEED_IDLE_SEC = float(DH_CFG.get("feed_idle_sec", 30))
+
 # ── 暖场（filler）语音（2026-10-22）─────────────────────────────────────────
 # 数字人每段固定开销很大（首帧要等十几秒），期间毫无声音 = 用户以为掉线。
 # 这里预生成一小批「嗯…」的短语音（同一音色，存盘复用），播放端在
@@ -804,7 +817,9 @@ for _kind, _defaults in _DEFAULT_WARMUP_LINES.items():
     _lines = DH_WARMUP_CFG.get(_kind) or _defaults
     DH_WARMUP_LINES[_kind] = [str(s).strip() for s in _lines if str(s).strip()] or _defaults
 # 一段回复里最多插几句中间暖场（插多了像卡带，「嗯嗯嗯」很吵）
-DH_WARMUP_MAX_MID = int(DH_WARMUP_CFG.get("max_mid", 3))
+DH_WARMUP_MAX_MID = int(DH_WARMUP_CFG.get("max_mid", 8))
+# 还没有实测样本时，首段等待的保守估计（秒）：暖场按这个长度铺，宁多勿少
+DH_WARMUP_EST_WAIT = float(DH_WARMUP_CFG.get("est_wait_default", 20))
 # 暖场产物目录：assets/warmup（与 bg-images / task-videos 同级，随 assets 一起挂载）
 # HERE 打底：cwd 不一定等于 /app，相对路径别靠运气（绝对路径时 HERE/x 仍返回 x）。
 DH_WARMUP_DIR = (HERE / BG_IMAGES_DIR).parent / "warmup"
@@ -1133,17 +1148,30 @@ def _dh_has_newer_pending() -> bool:
 
 
 class DHSpeakRequest(BaseModel):
-    text: str
+    text: str = ""
+    # 流式追加：插件按句把新完成的文本喂给正在跑的任务（code 相同）。
+    append: bool = False
+    # 这段文本之后不会再有新内容（整条回复结束），worker 可以收尾出 done。
+    done: bool = False
+    code: str = ""
 
 
 @app.post("/api/dh/speak")
 async def dh_speak(req: DHSpeakRequest) -> dict:
-    """提交一段回复文本，生成数字人口播视频（后台排队，最新替换未开始任务）。"""
+    """提交一段回复文本，生成数字人口播视频（后台排队，最新替换未开始任务）。
+
+    append=true 时不新建任务，而是把文本追加到 code 对应的任务上（流式喂料）：
+    LLM 还在吐字，DUIX 已经在渲染前面几句了。
+    """
     if not _dh_enabled_now():
         _dh_stat("rejected")
         _dh_stats["last_reject"] = "数字人开关关闭（/api/dh/enable {enabled:true} 可打开）"
         raise HTTPException(status_code=400, detail="digital_human disabled (POST /api/dh/enable {enabled:true} to turn on)")
     text = (req.text or "").strip()
+    if req.append:
+        if not req.code:
+            raise HTTPException(status_code=400, detail="Empty code for append")
+        return _dh_append(req.code, text, req.done)
     if not text:
         _dh_stat("rejected")
         _dh_stats["last_reject"] = "空文本"
@@ -1152,12 +1180,17 @@ async def dh_speak(req: DHSpeakRequest) -> dict:
         logger.warning("DH text truncated from %d to %d chars", len(text), DH_MAX_TEXT)
         text = text[:DH_MAX_TEXT]
     code = str(uuid4())
+    feed = _dh_feed_new(text, closed=True)
+    _dh_feed_pump(feed)  # 入队前先切好段（首段短切），worker 一起来就能提交
     with _dh_lock:
         # 只保留正在运行的任务，未开始的旧排队任务被最新提交替换
         _dh_queue[:] = [t for t in _dh_queue if t["started"]]
-        _dh_queue.append({"code": code, "text": text, "started": False})
+        _dh_queue.append({"code": code, "text": text, "started": False, "feed": feed})
         pending = sum(1 for t in _dh_queue if not t["started"])
-    logger.info("DH enqueue: %s (%d chars), pending=%d", code, len(text), pending)
+    logger.info(
+        "DH enqueue: %s (%d chars, %d segment(s)), pending=%d",
+        code, len(text), len(feed["segments"]), pending,
+    )
     _dh_stat("submits")
     _dh_stats["last_submit_at"] = time.time()
     # 暖场音频随提交一起返回：前端拿到就立刻播「嗯…」，不用再发一次请求
@@ -1195,7 +1228,10 @@ async def dh_status() -> dict:
     """数字人任务状态：插件轮询；done 时带 video_url。"""
     _dh_stat("status_polls")
     _dh_stats["last_poll_at"] = time.time()
-    return _dh_get()
+    data = _dh_get()
+    # 首段预计等待：前端用它决定暖场该铺多长（预计 25s 就一句接一句，别播两句就干等）
+    data["est_wait"] = _estimate_first_segment_wait()
+    return data
 
 
 @app.get("/api/dh/warmup")
@@ -1277,6 +1313,7 @@ async def dh_warmup_pick(req: WarmupPickRequest) -> dict:
         "open": _prefer_rendered(urls["open"], open_idx),
         "mid": [_prefer_rendered(urls["mid"], i) for i in mid_idx],
         "max_mid": DH_WARMUP_MAX_MID,
+        "est_wait": _estimate_first_segment_wait(),
     }
 
 
@@ -1674,6 +1711,36 @@ def _warmup_video_name(wav_name: str) -> str:
     return wav_name[:-4] + ".mp4" if wav_name.lower().endswith(".wav") else wav_name + ".mp4"
 
 
+_wav_sec_cache: dict[str, float] = {}
+
+
+def _wav_seconds(path: Path) -> float:
+    """暖场音频时长（秒）。前端要按它算「填到视频来为止」的总预算。"""
+    key = str(path)
+    cached = _wav_sec_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        with wave.open(str(path), "rb") as handle:
+            sec = handle.getnframes() / float(handle.getframerate() or 16000)
+    except Exception:  # noqa: BLE001
+        sec = 0.0
+    _wav_sec_cache[key] = sec
+    return sec
+
+
+def _estimate_first_segment_wait() -> float:
+    """首段「提交 → 出片」的预计秒数（最近 5 次的平均）。
+
+    暖场靠这个数字决定填多久：预计等 25 秒就一句接一句地补，别播两句就干等。
+    没有样本时用配置里的保守值。
+    """
+    samples = list(_dh_stats.get("first_seg_samples") or [])[-5:]
+    if samples:
+        return round(sum(samples) / len(samples), 1)
+    return float(DH_WARMUP_EST_WAIT)
+
+
 def _warmup_urls(persona: str | None = None) -> dict:
     """可用的暖场条目：video（数字人口型）优先，audio 兜底。
 
@@ -1694,6 +1761,8 @@ def _warmup_urls(persona: str | None = None) -> dict:
             items.append({
                 "audio": f"/media/warmup/{n}",
                 "video": f"/media/warmup/{vname}" if (DH_WARMUP_DIR / vname).is_file() else None,
+                # 时长给前端算预算：填到首段视频来为止，别播两句就干等
+                "sec": round(_wav_seconds(DH_WARMUP_DIR / n), 2),
             })
         out[kind] = items
     return {**out, "max_mid": DH_WARMUP_MAX_MID}
@@ -1923,6 +1992,128 @@ async def _dh_query(client: httpx.AsyncClient, code: str, base: str | None = Non
     return body.get("data") or {}
 
 
+# ── 增量喂料（流式追加，2026-10-23）────────────────────────────────────────
+_SENT_END_RE = re.compile(r"[。！？!?；;…\n]")
+
+
+def _dh_split_all(text: str) -> list[str]:
+    """整段文本按当前分段策略一次切好（一次性模式 / 收尾 flush 用）。"""
+    if DH_SEGMENT_MODE in ("punct", "punctuation"):
+        return [s for s in _split_by_punct(text, DH_SEGMENT_CHARS, DH_SEGMENT_MIN_CHARS) if s]
+    return [s for s in _split_segments(text, DH_SEGMENT_CHARS) if s]
+
+
+def _dh_cut_ready(buf: str, min_chars: int) -> tuple[list[str], str]:
+    """从缓冲里切出「已经完整、且够长」的段，返回 (段列表, 未成段的尾巴)。
+
+    流式追加时绝不能把半句话拿出去渲染（会念到一半断掉），所以只在句末
+    标点处切；没有句末标点的尾巴一律留着等下一批文本。
+    """
+    out: list[str] = []
+    rest = buf
+    while True:
+        cut = -1
+        for m in _SENT_END_RE.finditer(rest):
+            if m.end() >= min_chars:
+                cut = m.end()
+                break
+        if cut < 0:
+            # 一直没有句末标点（长代码块 / 长列表）：攒到两倍上限就退化成硬切
+            while len(rest) > DH_SEGMENT_CHARS * 2:
+                out.extend(_dh_split_all(rest[:DH_SEGMENT_CHARS]))
+                rest = rest[DH_SEGMENT_CHARS:]
+            break
+        head = rest[:cut]
+        out.extend(_dh_split_all(head) if len(head) > DH_SEGMENT_CHARS else [head.strip()])
+        rest = rest[cut:]
+    return [p for p in out if p], rest
+
+
+def _dh_feed_new(text: str, closed: bool) -> dict:
+    """新建一个喂料缓冲（一段回复一个）。"""
+    return {
+        "text": text,      # 累计全文（status.text / 失败回退整段 TTS 用）
+        "buffer": text,    # 还没切成段的尾巴
+        "segments": [],    # 已确定的段：下标即 -sN 编号，只增不改
+        "closed": closed,  # 不会再有新文本
+        "first": True,     # 还没切出过任何一段（首段走短预算，首帧更早）
+        "event": asyncio.Event(),
+    }
+
+
+def _dh_feed_pump(feed: dict) -> int:
+    """把缓冲里能切的段切进 segments，返回新增段数。"""
+    added = 0
+    if feed["closed"]:
+        buf = feed["buffer"]
+        feed["buffer"] = ""
+        if buf.strip():
+            if feed["first"] and DH_FIRST_SEGMENT_CHARS > 0:
+                head, body = _take_first_segment(buf, DH_FIRST_SEGMENT_CHARS, DH_FIRST_SEGMENT_MIN_CHARS)
+                pieces = ([head] if head else []) + (_dh_split_all(body) if body else [])
+                if head and body:
+                    logger.info("DH feed: first segment shortened to %d chars — first frame sooner", len(head))
+            else:
+                pieces = _dh_split_all(buf)
+            feed["segments"].extend(pieces)
+            added = len(pieces)
+    else:
+        # 首段用短预算（首帧尽早出现），之后攒够 append_min_chars 再切
+        min_chars = DH_APPEND_MIN_CHARS
+        if feed["first"]:
+            min_chars = max(DH_FIRST_SEGMENT_MIN_CHARS, min(DH_APPEND_MIN_CHARS, DH_FIRST_SEGMENT_CHARS))
+        pieces, rest = _dh_cut_ready(feed["buffer"], min_chars)
+        feed["segments"].extend(pieces)
+        feed["buffer"] = rest
+        added = len(pieces)
+    if added:
+        feed["first"] = False
+        feed["event"].set()
+    return added
+
+
+def _dh_feed_add(feed: dict, text: str, done: bool = False) -> int:
+    """追加一段新文本（done=True 表示这是最后一段），返回新增段数。"""
+    text = (text or "").strip()
+    if text:
+        room = DH_MAX_TEXT - len(feed["text"])
+        if room > 0:
+            text = text[:room]
+            feed["text"] += text
+            feed["buffer"] += text
+    if done:
+        feed["closed"] = True
+    return _dh_feed_pump(feed)
+
+
+async def _dh_feed_wait(feed: dict) -> bool:
+    """等下一批文本/段到来；超时返回 False（调用方按已到内容收尾）。"""
+    feed["event"].clear()
+    try:
+        await asyncio.wait_for(feed["event"].wait(), timeout=DH_FEED_IDLE_SEC)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+def _dh_append(code: str, text: str, done: bool) -> dict:
+    """把文本追加到 code 对应的任务（流式喂料）。任务已结束/不存在则不做事。"""
+    with _dh_lock:
+        item = next((t for t in _dh_queue if t["code"] == code), None)
+    if item is None:
+        logger.info("DH append: %s not running (finished?), text dropped (%d chars)", code, len(text))
+        return {"ok": False, "reason": "gone", "code": code}
+    feed = item["feed"]
+    added = _dh_feed_add(feed, text, done)
+    if _dh_state.get("code") == code:
+        _dh_set(text=feed["text"], total_segments=len(feed["segments"]))
+    logger.info(
+        "DH %s: append %d chars (done=%s) -> +%d segment(s), %d total, buffer=%d",
+        code, len(text), done, added, len(feed["segments"]), len(feed["buffer"]),
+    )
+    return {"ok": True, "code": code, "appended": added, "total_segments": len(feed["segments"])}
+
+
 async def _dh_run(item: dict) -> None:
     """处理一个数字人回复：切成语义完整的小段 → 逐段 TTS + 提交 DUIX。
 
@@ -1932,36 +2123,22 @@ async def _dh_run(item: dict) -> None:
     首段单独走 first_segment_chars 的小预算（首帧尽早出现），其余段按
     segment_chars / segment_min_chars 正常合并（保总时长）。
     """
-    code, text = item["code"], item["text"]
-    # 首段短切：先把第一句单独取出（≤ first_segment_chars 字），剩下的再按
-    # 正常预算成段。首段决定首帧延迟，其余段决定后续吞吐，两者解耦。
-    head = ""
-    body = text
-    if DH_FIRST_SEGMENT_CHARS > 0:
-        head, body = _take_first_segment(text, DH_FIRST_SEGMENT_CHARS, DH_FIRST_SEGMENT_MIN_CHARS)
-        if not body:
-            head = ""  # 整条回复还没首段长，没必要特殊处理
-    if DH_SEGMENT_MODE in ("punct", "punctuation"):
-        segments = [s for s in _split_by_punct(body or text, DH_SEGMENT_CHARS, DH_SEGMENT_MIN_CHARS) if s]
-    else:
-        segments = [s for s in _split_segments(body or text, DH_SEGMENT_CHARS) if s]
-    if head:
-        segments.insert(0, head)
-        logger.info(
-            "DH %s: first segment shortened to %d chars (limit %d) — first frame sooner",
-            code, len(head), DH_FIRST_SEGMENT_CHARS,
-        )
-    if not segments:
-        _dh_set(state="error", message="文本为空", code=code, text=text)
+    code = item["code"]
+    feed = item["feed"]
+    if not feed["segments"]:
+        _dh_feed_pump(feed)  # 兜底：入队前没切过段（理论上不会）
+    if not feed["segments"] and feed["closed"]:
+        _dh_set(state="error", message="文本为空", code=code, text=feed["text"])
         return
-    total = len(segments)
     # lane 数 = DUIX 实例数（每实例同时只能跑一个任务），第 i 段固定发给
     # 第 i % lanes 个实例。两段并行渲染后 GPU 峰值从 ~70% 到 ~96%。
-    lanes = max(1, min(len(DH_DUIX_BASES), total))
+    # 流式喂料时段数是渐增的，所以这里只看实例数。
+    lanes = max(1, len(DH_DUIX_BASES))
+    run_started = time.time()
     try:
         _dh_set(
-            state="tts", message="语音合成中…", code=code, text=text,
-            video_file="", video_url="", videos=[], total_segments=total,
+            state="tts", message="语音合成中…", code=code, text=feed["text"],
+            video_file="", video_url="", videos=[], total_segments=len(feed["segments"]),
             done_segments=0, progress=0,
         )
         clients = [httpx.AsyncClient(timeout=20) for _ in range(lanes)]
@@ -1978,22 +2155,24 @@ async def _dh_run(item: dict) -> None:
             """取（或首次创建）第 idx 段的 TTS 任务。"""
             task = tts_prefetch.get(idx)
             if task is None:
-                task = asyncio.create_task(_dh_synth_segment(segments[idx]))
+                task = asyncio.create_task(_dh_synth_segment(feed["segments"][idx]))
                 tts_prefetch[idx] = task
             return task
 
         async def render(idx: int) -> bool:
             """提交 + 轮询成品；成功则把文件名写进 rendered。语音用预取好的那份。"""
+            total_now = max(1, len(feed["segments"]))
             _dh_set(
                 state="generating",
-                message=f"数字人生成中 {appended + 1}/{total}…",
-                code=code, text=text, done_segments=appended,
-                progress=round(appended / total * 100),
+                message=f"数字人生成中 {appended + 1}/{total_now}…",
+                code=code, text=feed["text"], done_segments=appended,
+                total_segments=total_now,
+                progress=round(appended / total_now * 100),
             )
             wav_path = await _prefetch_tts(idx)
             lane = idx % lanes
             fname = await _dh_submit_and_wait(
-                clients[lane], f"{code}-s{idx}", wav_path, code, text, DH_DUIX_BASES[lane],
+                clients[lane], f"{code}-s{idx}", wav_path, code, feed["text"], DH_DUIX_BASES[lane],
             )
             if fname is None:
                 return False
@@ -2002,7 +2181,8 @@ async def _dh_run(item: dict) -> None:
 
         inflight: dict[int, asyncio.Task] = {}
         try:
-            while appended < total:
+            while True:
+                total = len(feed["segments"])
                 # 补满 lane（判废/被新回复顶替就停止再启动新段）
                 while started < total and len(inflight) < lanes:
                     if code in _dh_discarded:
@@ -2013,8 +2193,8 @@ async def _dh_run(item: dict) -> None:
                         # 切到新任务的播放列表。
                         _dh_set(
                             state="discarded", message="被新回复取代",
-                            progress=round(appended / total * 100),
-                            code=code, text=text, done_segments=appended,
+                            progress=round(appended / max(1, total) * 100),
+                            code=code, text=feed["text"], done_segments=appended,
                         )
                         logger.info(
                             "DH %s: preempted by newer task at segment %d/%d",
@@ -2029,11 +2209,27 @@ async def _dh_run(item: dict) -> None:
                         _prefetch_tts(started + 1)
                     started += 1
                 if code in _dh_discarded:
-                    _dh_set(state="discarded", message="已取消（被打断）", progress=0, code=code, text=text, videos=[])
+                    _dh_set(state="discarded", message="已取消（被打断）", progress=0, code=code, text=feed["text"], videos=[])
                     logger.info("DH %s: discarded before segment %d", code, started)
                     failed = True
-                if not inflight:
+                if failed:
                     break
+                if not inflight:
+                    if feed["closed"]:
+                        break  # 没有在跑的段，也不会再有新文本
+                    if code in _dh_discarded:
+                        # 空闲等文本期间被打断：别傻等到超时，立刻收工
+                        _dh_set(state="discarded", message="已取消（被打断）", progress=0, code=code, text=feed["text"], videos=[])
+                        logger.info("DH %s: discarded while waiting for text", code)
+                        failed = True
+                        break
+                    # 流式喂料：暂时没有可渲染的新段 → 等插件追加下一批文本。
+                    if not await _dh_feed_wait(feed):
+                        logger.info(
+                            "DH %s: no new text for %.0fs, closing task", code, DH_FEED_IDLE_SEC,
+                        )
+                        _dh_feed_add(feed, "", True)
+                    continue
                 done_set, _ = await asyncio.wait(
                     inflight.values(), return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -2051,17 +2247,26 @@ async def _dh_run(item: dict) -> None:
                 # 按顺序入库：并行完成顺序可能乱，播放端依赖 videos 的顺序续播
                 while appended in rendered:
                     fname = rendered.pop(appended)
+                    if appended == 0:
+                        # 首段耗时是暖场的预算基准：暖场要铺到这一段出片为止
+                        samples = list(_dh_stats.get("first_seg_samples") or [])
+                        samples.append(round(time.time() - run_started, 1))
+                        _dh_stats["first_seg_samples"] = samples[-10:]
+                        logger.info(
+                            "DH %s: first segment %.1fs (est_wait -> %.1fs)",
+                            code, samples[-1], _estimate_first_segment_wait(),
+                        )
                     with _dh_lock:
                         videos = _dh_state.get("videos", [])
                         videos = videos + [{"video_file": fname, "video_url": f"/media/dh/{fname}"}]
                         _dh_state["videos"] = videos
-                    _dh_record_history(f"{code}-s{appended}", fname, segments[appended])
+                    _dh_record_history(f"{code}-s{appended}", fname, feed["segments"][appended])
                     appended += 1
                     _dh_set(
                         state="generating",
-                        message=f"数字人生成中 {appended}/{total}…",
-                        code=code, text=text, done_segments=appended,
-                        progress=round(appended / total * 100),
+                        message=f"数字人生成中 {appended}/{max(1, len(feed['segments']))}…",
+                        code=code, text=feed["text"], done_segments=appended,
+                        progress=round(appended / max(1, len(feed["segments"])) * 100),
                     )
                 if failed:
                     break
@@ -2080,11 +2285,12 @@ async def _dh_run(item: dict) -> None:
         with _dh_lock:
             videos = list(_dh_state.get("videos", []))
         first = videos[0] if videos else {}
+        total = len(feed["segments"])
         _dh_set(
             state="done", message="数字人视频已就绪", progress=100,
             video_file=first.get("video_file", ""),
             video_url=first.get("video_url", ""),
-            code=code, text=text, total_segments=total, done_segments=total,
+            code=code, text=feed["text"], total_segments=total, done_segments=total,
         )
         _dh_prune_videos()
         logger.info(
@@ -2094,9 +2300,9 @@ async def _dh_run(item: dict) -> None:
     except Exception as exc:  # noqa: BLE001 - surfaced to the plugin
         logger.exception("DH %s: task failed", code)
         if code in _dh_discarded:
-            _dh_set(state="discarded", message="已取消（被打断）", progress=0, code=code, text=text, videos=[])
+            _dh_set(state="discarded", message="已取消（被打断）", progress=0, code=code, text=feed["text"], videos=[])
         else:
-            _dh_set(state="error", message=f"任务异常: {type(exc).__name__}", code=code, text=text)
+            _dh_set(state="error", message=f"任务异常: {type(exc).__name__}", code=code, text=feed["text"])
 
 
 async def _dh_synth_segment(seg_text: str) -> Path:

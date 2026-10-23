@@ -120,14 +120,17 @@ export const ReplySpeakerMount = memo(function ReplySpeakerMount({
   const interruptRef = useRef(false)
   const skipAnchorRef = useRef(0)
   const skipUntilRef = useRef(0)
-  // Digital-human: nodes whose finished reply was already handed to the bridge.
-  const dhSentRef = useRef(new Set<string>())
-  // Last-segment debounce per user turn: while a turn is still streaming, new
-  // settled texts keep replacing the "last" candidate; only once no new text
-  // arrives for LAST_DEBOUNCE_MS is the candidate confirmed and submitted.
-  // key = user anchor, value = { timer, anchor } (the candidate's anchor).
-  const dhLastDebounceRef = useRef(new Map<number, { timer: ReturnType<typeof setTimeout>; anchor: number }>())
-  const LAST_DEBOUNCE_MS = 4000
+  // Digital-human streaming feed: per node, the number of COMPLETE sentences
+  // already handed to the bridge (node.key -> count). Sentences are the unit
+  // because a half-sentence must never be rendered (the video would stop
+  // mid-word and the rest could not be appended in sync).
+  const dhSentRef = useRef(new Map<string, number>())
+  // Serial feed chain: appends for one reply MUST arrive at the bridge in text
+  // order, and the first one carries no code yet — chaining keeps that simple.
+  const dhFeedRef = useRef<Promise<void>>(Promise.resolve())
+  // Highest assistant anchor whose turn was already closed with `done: true`,
+  // so the bridge knows no more text is coming (it can finish the task).
+  const dhDoneAnchorRef = useRef(0)
   // 桥接侧数字人开关（null = 尚未确认）。它现在**可以热切**：本地开关一翻，
   // 插件会 POST /api/dh/enable，桥接状态变化后广播 DH_CHANGE_EVENT，这里重新
   // 拉取——所以不能再像以前那样只在挂载时解析一次（关掉就再也回不来）。
@@ -149,12 +152,10 @@ export const ReplySpeakerMount = memo(function ReplySpeakerMount({
     return () => _registerInterruptHandler(null)
   }, [_registerInterruptHandler])
 
-  // Unmount: stop playback, release any in-flight TTS, clear DH debounce timers.
+  // Unmount: stop playback and release any in-flight TTS.
   useEffect(() => () => {
     speaker.stop()
     _registerTtsAbort(null)
-    for (const { timer } of dhLastDebounceRef.current.values()) clearTimeout(timer)
-    dhLastDebounceRef.current.clear()
   }, [speaker, _registerTtsAbort])
 
   // Track the BRIDGE-side digital-human switch (it can change at runtime): poll
@@ -196,7 +197,10 @@ export const ReplySpeakerMount = memo(function ReplySpeakerMount({
     // later (or that already appeared) still speak. In DH mode, discard the
     // pending video task (the reply is being talked over).
     if (interruptRef.current) {
-      if (dhMode) dhDiscard(lastDhCodeRef.current)
+      if (dhMode) {
+        dhDiscard(lastDhCodeRef.current)
+        lastDhCodeRef.current = null
+      }
       let maxAnchor = 0
       for (const node of chatNodes(chat)) {
         if (node.kind === 'assistant-step' && node.anchorSeq > maxAnchor) maxAnchor = node.anchorSeq
@@ -237,91 +241,101 @@ export const ReplySpeakerMount = memo(function ReplySpeakerMount({
           }
         }
       }
-      // New user turn after a DH-submitted reply: the pending video is stale.
+      // New user turn: whatever video is still rendering belongs to the
+      // previous answer — drop it AND forget its code, so this turn's streamed
+      // appends create a fresh task instead of feeding a discarded one.
       for (const node of chatNodes(chat)) {
         if (node.kind !== 'user') continue
         if (node.anchorSeq <= lastUserAnchorRef.current) continue
+        const hadPreviousTurn = lastUserAnchorRef.current > 0
         lastUserAnchorRef.current = node.anchorSeq
-        if (lastDhReplyAnchorRef.current > 0 && node.anchorSeq > lastDhReplyAnchorRef.current) {
+        if (hadPreviousTurn && lastDhCodeRef.current !== null) {
           dhDiscard(lastDhCodeRef.current)
+          lastDhCodeRef.current = null
         }
         // 用户刚说完 → 立刻并行挑暖场（与真正的问答互不阻塞）。这一句是
         // 唯一能在「首段视频还要十几秒」期间给出即时反馈的东西。
         const said = userNodeText(node)
         if (said !== '') void dhPickWarmup(said)
       }
-      // Submit settled, fully-streamed replies' full text to the bridge.
-      // No sentence TTS here — the video carries the audio; the companion
-      // window plays it (TTS + talking-head together) when generation ends.
-      // Per USER turn, deliver only the FIRST and the LAST settled assistant
-      // texts. A user turn spans one user node to the next; an agent reply
-      // (first answer A -> tool call -> final answer B) is ONE user turn, so
-      // both A and B are spoken, while every intermediate text — tool-call
-      // output, transitional chatter, mid-work updates — never spawns a video.
-      // (Pure chat turns have first === last and deliver once.)
+
+      // ── 流式喂料（2026-10-23）────────────────────────────────────────────
+      // 以前必须等整条回复 settled 才 dhSpeak：用户说完 → 等 LLM 吐完（实测
+      // 1000 字 37s）→ 再等首段 10~15s，这几十秒全靠暖场「嗯…」顶着，一听
+      // 就是卡。现在按句把「已完成的文本」追加进同一个 DUIX 任务：LLM 还在
+      // 吐字，DUIX 已经在渲染前面几句，两段时间完全重叠。
+      // 单位是**完整句子**（splitSentences）：半句绝不能提交，否则视频会在
+      // 词中间断掉，后面的文本也没法接着排下去。
+      const feedDh = (text: string, done: boolean): void => {
+        dhFeedRef.current = dhFeedRef.current
+          .then(() => {
+            const code = lastDhCodeRef.current
+            return dhSpeak(text, code === null ? { done } : { append: true, done, code })
+          })
+          .then((res) => {
+            if (res === null) return
+            if (res.reason === 'gone') {
+              // 桥接侧那个任务已经收尾了（空闲超时）：下一句重新开一个任务，
+              // 文本顺序依然正确——前面那些句子早就播完了。
+              lastDhCodeRef.current = null
+              return
+            }
+            if (typeof res.code === 'string' && res.code !== '') {
+              lastDhCodeRef.current = res.code
+            }
+          })
+      }
+
       const userAnchors: number[] = []
       for (const node of chatNodes(chat)) {
         if (node.kind === 'user') userAnchors.push(node.anchorSeq)
       }
       userAnchors.sort((a, b) => a - b)
-      type TurnPick = { node: { key: string; anchorSeq: number }; data: AssistantChatData; anchor: number }
-      const perUserTurn = new Map<number, { first: TurnPick; last: TurnPick }>()
+      type TurnStep = { node: { key: string; anchorSeq: number }; data: AssistantChatData; anchor: number }
+      const perUserTurn = new Map<number, TurnStep[]>()
       for (const node of chatNodes(chat)) {
         if (node.kind !== 'assistant-step') continue
         const data = assistantData(node)
-        if (data === undefined || data.status !== 'settled') continue
-        const text = cleanReplyText(nodeText(data), 100000)
-        if (text.trim().length < 2) continue
+        if (data === undefined || data.status === 'interrupted') continue
+        const base = baselineRef.current
+        if (base !== null && node.anchorSeq <= base) continue
+        if (node.anchorSeq === skipAnchorRef.current) continue
+        if (cleanReplyText(nodeText(data), 100000).trim().length < 2) continue
         // The user turn this reply belongs to = nearest preceding user anchor.
         let ua = -1
         for (const u of userAnchors) {
           if (u < node.anchorSeq) ua = u
           else break
         }
-        const pick: TurnPick = { node, data, anchor: node.anchorSeq }
-        const slot = perUserTurn.get(ua)
-        if (slot === undefined) {
-          perUserTurn.set(ua, { first: pick, last: pick })
-        } else {
-          if (node.anchorSeq < slot.first.anchor) slot.first = pick
-          if (node.anchorSeq > slot.last.anchor) slot.last = pick
-        }
+        const list = perUserTurn.get(ua) ?? []
+        list.push({ node, data, anchor: node.anchorSeq })
+        perUserTurn.set(ua, list)
       }
-      const submitDh = (pick: TurnPick): void => {
-        const base = baselineRef.current
-        if (base !== null && pick.anchor <= base) return
-        if (pick.anchor === skipAnchorRef.current) return
-        if (dhSentRef.current.has(pick.node.key)) return
-        const text = cleanReplyText(nodeText(pick.data), 100000)
-        if (text.trim().length < 2) return
-        dhSentRef.current.add(pick.node.key)
-        lastDhReplyAnchorRef.current = pick.anchor
-        void dhSpeak(text).then((code) => {
-          if (code !== null) lastDhCodeRef.current = code
-        })
-      }
-      for (const [ua, { first, last }] of perUserTurn) {
-        // FIRST segment: submit immediately (it is settled and will not change).
-        submitDh(first)
-        if (first.node.key === last.node.key) {
-          // Pure chat turn (no tool-call churn): first === last, nothing else.
-          const existing = dhLastDebounceRef.current.get(ua)
-          if (existing !== undefined) {
-            clearTimeout(existing.timer)
-            dhLastDebounceRef.current.delete(ua)
-          }
-          continue
+      // 一轮回复 = 一个 DUIX 任务：步内已完成的句子按顺序追加，整轮吐完才
+      // 发 done（桥接据此收尾，否则它会一直空等下一批文本）。
+      for (const [, steps] of perUserTurn) {
+        steps.sort((a, b) => a.anchor - b.anchor)
+        let lastAnchor = 0
+        let allSettled = true
+        for (const step of steps) {
+          lastAnchor = Math.max(lastAnchor, step.anchor)
+          if (step.data.status !== 'settled') allSettled = false
+          const { sentences, partial } = splitSentences(cleanReplyText(nodeText(step.data), 100000))
+          const ready = step.data.status === 'settled' && partial !== null
+            ? [...sentences, partial]
+            : sentences
+          const sent = dhSentRef.current.get(step.node.key) ?? 0
+          if (ready.length <= sent) continue
+          dhSentRef.current.set(step.node.key, ready.length)
+          const fresh = ready.slice(sent).join('').trim()
+          if (fresh === '') continue
+          lastDhReplyAnchorRef.current = Math.max(lastDhReplyAnchorRef.current, step.anchor)
+          feedDh(fresh, false)
         }
-        // LAST segment: debounce — replace the candidate (reset the timer) on
-        // every new settled text so an intermediate text never gets submitted;
-        // only a 4s-quiet turn submits its final segment.
-        const existing = dhLastDebounceRef.current.get(ua)
-        if (existing !== undefined) clearTimeout(existing.timer)
-        const timer = setTimeout(() => {
-          dhLastDebounceRef.current.delete(ua)
-          submitDh(last)
-        }, LAST_DEBOUNCE_MS)
-        dhLastDebounceRef.current.set(ua, { timer, anchor: last.anchor })
+        if (allSettled && lastAnchor > 0 && dhDoneAnchorRef.current < lastAnchor) {
+          dhDoneAnchorRef.current = lastAnchor
+          feedDh('', true)
+        }
       }
       return
     }
