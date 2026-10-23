@@ -21,7 +21,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 // Type-only: pulls ui-chat's `useChat` into SessionStandardProps (0.1.3).
 import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { AssistantChatData } from '@deepseek-ai/dsh-client-ui-chat/client'
-import { tts, dhSpeak, dhStatus, dhDiscard, DH_CHANGE_EVENT } from '../bridge.ts'
+import { tts, dhSpeak, dhStatus, dhDiscard, dhPickWarmup, DH_CHANGE_EVENT } from '../bridge.ts'
 import { readDigitalHuman } from '../DigitalHumanToggle.tsx'
 import type { VoiceInjected } from '../contract.ts'
 import { cleanReplyText } from './clean.ts'
@@ -59,6 +59,24 @@ function nodeText(data: AssistantChatData): string {
     .filter(block => block.kind === 'text')
     .map(block => block.text)
     .join('\n')
+}
+
+/**
+ * Best-effort text of a user node. Only used to brief the filler picker
+ * ("what did the user just say?"), so any shape surprise degrades to '' and
+ * the bridge falls back to keyword rules.
+ */
+function userNodeText(node: { data: unknown }): string {
+  const data = node.data as
+    | { text?: unknown; blocks?: Array<{ kind?: string; text?: unknown }> }
+    | undefined
+  if (typeof data?.text === 'string') return data.text
+  const blocks = data?.blocks
+  if (!Array.isArray(blocks)) return ''
+  return blocks
+    .filter(block => block.kind === 'text' && typeof block.text === 'string')
+    .map(block => block.text as string)
+    .join(' ')
 }
 
 /** Full props: framework runtime share + `voice` locale seat + injected face. */
@@ -210,6 +228,15 @@ export const ReplySpeakerMount = memo(function ReplySpeakerMount({
     }
 
     if (dhMode) {
+      // First sight of the conversation: align the user watermark with what is
+      // already there, so loading history never fires a filler request.
+      if (lastUserAnchorRef.current === 0) {
+        for (const node of chatNodes(chat)) {
+          if (node.kind === 'user' && node.anchorSeq > lastUserAnchorRef.current) {
+            lastUserAnchorRef.current = node.anchorSeq
+          }
+        }
+      }
       // New user turn after a DH-submitted reply: the pending video is stale.
       for (const node of chatNodes(chat)) {
         if (node.kind !== 'user') continue
@@ -218,6 +245,10 @@ export const ReplySpeakerMount = memo(function ReplySpeakerMount({
         if (lastDhReplyAnchorRef.current > 0 && node.anchorSeq > lastDhReplyAnchorRef.current) {
           dhDiscard(lastDhCodeRef.current)
         }
+        // 用户刚说完 → 立刻并行挑暖场（与真正的问答互不阻塞）。这一句是
+        // 唯一能在「首段视频还要十几秒」期间给出即时反馈的东西。
+        const said = userNodeText(node)
+        if (said !== '') void dhPickWarmup(said)
       }
       // Submit settled, fully-streamed replies' full text to the bridge.
       // No sentence TTS here — the video carries the audio; the companion

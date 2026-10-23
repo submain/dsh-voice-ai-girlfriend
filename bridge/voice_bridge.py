@@ -776,8 +776,28 @@ DH_WARMUP_ENABLED = bool(DH_WARMUP_CFG.get("enabled", True))
 # 话术别用长串「……」：Qwen3 克隆会把省略号读成长停顿（实测「嗯……我看看啊。」
 # 合成出 5.6s，比整段视频还久）。用逗号/句号控制节奏，每条控制在 ~1-3s。
 _DEFAULT_WARMUP_LINES = {
-    "open": ["嗯，我看看啊。", "嗯，让我想想。", "哦，这个嘛。"],
-    "mid": ["嗯……", "那个……", "嗯，等我一下。"],
+    "open": [
+        "嗯，我看看啊。",
+        "嗯，让我想想。",
+        "哦，这个嘛。",
+        "唔，我想一下。",
+        "嗯，这个问题有意思。",
+        "好，我理一理。",
+        "嗯，让我组织一下。",
+        "哦对，我知道这个。",
+    ],
+    "mid": [
+        "嗯……",
+        "那个……",
+        "嗯，等我一下。",
+        "我想想啊。",
+        "唔……",
+        "嗯，是这样的。",
+        "让我确认一下。",
+        "嗯，别急。",
+        "稍等啊。",
+        "我理一下思路。",
+    ],
 }
 DH_WARMUP_LINES: dict[str, list[str]] = {}
 for _kind, _defaults in _DEFAULT_WARMUP_LINES.items():
@@ -1194,6 +1214,87 @@ async def dh_warmup() -> dict:
     return {"voice": _current_persona, "enabled": DH_WARMUP_ENABLED, **urls}
 
 
+class WarmupReport(BaseModel):
+    """前端暖场播放回执。
+
+    浏览器对「有声自动播放」的策略会把 play() 静默 reject（特别是页面被判为
+    不可见时），此时请求照样发出、音频文件照样下载，只是没声音——光看桥接
+    侧的 HTTP 日志完全区分不出「没播」和「播了但被静音」。把结果报回来才能查。
+    """
+
+    ok: bool = True
+    kind: str = ""
+    error: str = ""
+    hidden: bool = False
+
+
+class WarmupPickRequest(BaseModel):
+    """用户刚说的那句话（前端从对话里取，取不到就传空串走规则）。"""
+
+    text: str = ""
+
+
+@app.post("/api/dh/warmup/pick")
+async def dh_warmup_pick(req: WarmupPickRequest) -> dict:
+    """挑一组贴合的暖场（模型优先，超时/异常即规则兜底）。
+
+    前端在「用户说完话」时发起，与真正的问答**并行**：这个请求只让模型吐
+    几个 token（实测几十~几百毫秒），而首段视频要十几秒，所以完全来得及。
+    """
+    if not DH_WARMUP_ENABLED:
+        return {"ok": False, "source": "off"}
+    urls = _warmup_urls(_current_persona)
+    if not urls["open"] or not urls["mid"]:
+        asyncio.create_task(_ensure_warmup(_current_persona))
+        return {"ok": False, "source": "empty"}
+
+    started = time.time()
+    scene = await _llm_pick_warmup(req.text)
+    source = "llm"
+    if scene is None:
+        scene = _rule_pick_warmup(req.text)
+        source = "rule"
+    open_idx, mid_idx = _WARMUP_SCENES[scene]
+
+    def _prefer_rendered(items: list[dict], idx: int) -> dict:
+        """挑中的那条要是还没渲染出动画，换一条已渲染的（宁可语气差一点）。"""
+        item = items[idx % len(items)]
+        if item.get("video") is None:
+            for other in items:
+                if other.get("video") is not None:
+                    return other
+        return item
+
+    logger.info(
+        "DH warmup pick: %s scene=%s open=%d mid=%s in %.0fms | %s",
+        source, scene, open_idx, mid_idx, (time.time() - started) * 1000, req.text[:40],
+    )
+    return {
+        "ok": True,
+        "source": source,
+        "scene": scene,
+        "ms": int((time.time() - started) * 1000),
+        "open": _prefer_rendered(urls["open"], open_idx),
+        "mid": [_prefer_rendered(urls["mid"], i) for i in mid_idx],
+        "max_mid": DH_WARMUP_MAX_MID,
+    }
+
+
+@app.post("/api/dh/warmup/report")
+async def dh_warmup_report(req: WarmupReport) -> dict:
+    if req.ok:
+        logger.info(
+            "DH warmup play ok (kind=%s, hidden=%s, note=%s)",
+            req.kind or "-", req.hidden, req.error[:80] or "-",
+        )
+    else:
+        logger.warning(
+            "DH warmup play FAILED (kind=%s, hidden=%s): %s",
+            req.kind or "-", req.hidden, req.error[:200] or "-",
+        )
+    return {"ok": True}
+
+
 class DHEnableRequest(BaseModel):
     enabled: bool
 
@@ -1452,6 +1553,120 @@ def _warmup_names(persona: str) -> dict[str, list[str]]:
         ]
         for kind, lines in DH_WARMUP_LINES.items()
     }
+
+
+# ── 暖场智能选择（大模型旁路，2026-10-23）──────────────────────────────────
+# 用户说完话 → 一个只吐几个 token 的小请求挑台词 → 同时发起真正的问答。
+# 两者并行：暖场请求几百毫秒就回，而首段视频要十几秒，这点延迟完全吃得下，
+# 换来的是「嗯…」的语气贴合当前话题。模型不给/超时/乱答 = 规则兜底。
+DH_WARMUP_LLM = DH_CFG.get("warmup_llm") or {}
+DH_WARMUP_LLM_ENABLED = bool(DH_WARMUP_LLM.get("enabled", True))
+DH_WARMUP_LLM_URL = str(DH_WARMUP_LLM.get("base_url") or "")
+DH_WARMUP_LLM_MODEL = str(DH_WARMUP_LLM.get("model") or "qwen3.8-27b")
+DH_WARMUP_LLM_KEY = str(
+    DH_WARMUP_LLM.get("api_key")
+    or os.environ.get(str(DH_WARMUP_LLM.get("api_key_env") or "QWEN_API_KEY"))
+    or ""
+)
+DH_WARMUP_LLM_TIMEOUT = float(DH_WARMUP_LLM.get("timeout_sec", 1.5))
+
+
+# 场景 → (开场索引, 垫场索引序列)。
+# 让模型只判断「属于哪种场景」，比让它从 18 句里挑编号稳得多：编号映射
+# 模型经常记错，而场景词是封闭枚举，几乎不会答歪。
+_WARMUP_SCENES: dict[str, tuple[int, list[int]]] = {
+    "thinking": (1, [3, 2, 0]),   # 求解/写代码/分析 → 让我想想
+    "surprised": (4, [0, 4, 5]),  # 惊讶/兴奋/有趣 → 这个问题有意思
+    "comfort": (0, [7, 0, 4]),    # 倾诉/低落/抱怨 → 嗯…… + 别急
+    "casual": (2, [5, 0, 8]),     # 寒暄/闲聊 → 哦，这个嘛
+    "confirm": (7, [5, 6, 0]),    # 提到之前的事/要确认 → 哦对，我知道这个
+    "unknown": (0, [0, 1, 2]),    # 判断不出 → 通用
+}
+
+# 中文类型词 ↔ 内部场景名。实测同一个模型，用中文枚举（【求解】【低落】…）
+# 分类准确率显著高于英文 scene 名（6/6 vs 1/5）——中文语境下别硬塞英文标签。
+_WARMUP_SCENE_ALIASES: dict[str, str] = {
+    "求解": "thinking", "thinking": "thinking",
+    "惊讶": "surprised", "surprised": "surprised",
+    "低落": "comfort", "comfort": "comfort",
+    "寒暄": "casual", "casual": "casual",
+    "回忆": "confirm", "confirm": "confirm",
+    "通用": "unknown", "unknown": "unknown",
+}
+
+
+def _warmup_llm_messages(user_text: str) -> list[dict]:
+    system = (
+        "你是语音助手。用户刚说完一句话，请判断这句话的类型。\n"
+        "类型只能是：【求解】【惊讶】【低落】【寒暄】【回忆】\n"
+        "- 【求解】问问题、让助手做事、要解法\n"
+        "- 【惊讶】吃惊、兴奋、觉得有趣\n"
+        "- 【低落】累、烦、难过、有压力\n"
+        "- 【寒暄】打招呼、闲聊\n"
+        "- 【回忆】提到以前聊过的事、问你记不记得\n"
+        '只输出 JSON，不要解释：{"type": "求解"}'
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"用户刚说：{user_text[:200]}"},
+    ]
+
+
+async def _llm_pick_warmup(user_text: str) -> str | None:
+    """让大模型判断场景；任何异常都返回 None 交给规则兜底。"""
+    if not (DH_WARMUP_LLM_ENABLED and DH_WARMUP_LLM_URL and user_text.strip()):
+        return None
+    payload = {
+        "model": DH_WARMUP_LLM_MODEL,
+        "messages": _warmup_llm_messages(user_text),
+        "max_tokens": 24,
+        "temperature": 0.2,
+        # 关掉思考：Qwen3 不关会把推理过程写进 content，既慢又把答案埋掉
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    headers = {"Content-Type": "application/json"}
+    if DH_WARMUP_LLM_KEY:
+        headers["Authorization"] = f"Bearer {DH_WARMUP_LLM_KEY}"
+    url = DH_WARMUP_LLM_URL.rstrip("/") + "/chat/completions"
+    try:
+        async with httpx.AsyncClient(timeout=DH_WARMUP_LLM_TIMEOUT) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            content = str(resp.json()["choices"][0]["message"]["content"])
+    except Exception as exc:  # noqa: BLE001 - 暖场绝不因为模型问题而失败
+        logger.info("DH warmup pick: LLM unavailable (%s)", exc)
+        return None
+    # 只要一个类型词：先按 JSON 抠，模型偶尔只吐裸词/带解释，再按别名扫一遍
+    match = re.search(r'"type"\s*:\s*"([^"]+)"', content) or re.search(r'"scene"\s*:\s*"?([a-z_]+)', content)
+    key = match.group(1) if match else None
+    scene = _WARMUP_SCENE_ALIASES.get(key or "")
+    if scene is None:
+        for alias, name in _WARMUP_SCENE_ALIASES.items():
+            if len(alias) > 1 and alias in content:
+                scene = name
+                break
+    if scene is None:
+        logger.info("DH warmup pick: LLM gave no type: %r", content[:60])
+        return None
+    logger.info("DH warmup pick: LLM said %r -> %s", content[:40], scene)
+    return scene
+
+
+# 规则兜底：模型慢/挂了也要有贴合语气的选择（场景词与模型输出同一套）。
+_WARMUP_RULES: list[tuple[str, str]] = [
+    (r"[?？]|为什么|怎么|如何|是什么|能不能|可不可以|帮我|请问|写一个|分析", "thinking"),
+    (r"哈哈|笑死|太棒|好家伙|居然|竟然|真的假的|牛啊|厉害|哇", "surprised"),
+    (r"难过|累|烦|焦虑|压力|不开心|委屈|害怕|担心|睡不着|崩溃", "comfort"),
+    (r"你记得|之前说|上次|还记得", "confirm"),
+    (r"你好|在吗|早|晚上好|哈喽|嗨|在么", "casual"),
+]
+
+
+def _rule_pick_warmup(user_text: str) -> str:
+    for pattern, scene in _WARMUP_RULES:
+        if re.search(pattern, user_text):
+            return scene
+    return "unknown"
 
 
 def _warmup_video_name(wav_name: str) -> str:

@@ -26,7 +26,7 @@ import type { CSSProperties } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: pulls ui-conversation's SlotMap merge for PropsRuntime resolution.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { bridgeBase, dhStatus, dhDiscard, onDhWarmup, tts, readVoiceEnabled, type DhStatus, type DhWarmup } from '../bridge.ts'
+import { bridgeBase, dhStatus, dhDiscard, onDhWarmup, onDhWarmupPick, reportWarmup, tts, readVoiceEnabled, type DhStatus, type DhWarmup } from '../bridge.ts'
 import { readDigitalHuman } from '../DigitalHumanToggle.tsx'
 import type { VoiceInjected } from '../contract.ts'
 import css from './CompanionWindow.module.css'
@@ -143,6 +143,12 @@ const VIDEO_STYLE: CSSProperties = {
   opacity: 0,
 }
 
+/**
+ * 前景层（数字人段 / 暖场片段）用更短的淡化：背景待机动画可以慢慢融，
+ * 但同一个人只是换个镜头，0.8s 会看出两层重叠（重影）。
+ */
+const DH_VIDEO_STYLE: CSSProperties = { ...VIDEO_STYLE, transition: 'opacity 0.16s ease-out' }
+
 /** The filler <audio> is audio-only: keep it out of the layout entirely. */
 const WARMUP_AUDIO_STYLE: CSSProperties = { display: 'none' }
 
@@ -238,8 +244,13 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
   const taskPendingStopRef = useRef(false)
   const wasSpeakingRef = useRef(false)
 
-  // Digital-human frame.
-  const dhRef = useRef<HTMLVideoElement | null>(null)
+  // Digital-human frame: TWO stacked layers (A/B) driven as a front/back pair.
+  // Swapping `src` on a single <video> blanks the picture until the new frame
+  // decodes — that blank frame is the "flash" between segments and between a
+  // filler clip and the real segment. So we always load into the hidden layer
+  // and only swap once it actually has a frame.
+  const dhLayersRef = useRef<Array<HTMLVideoElement | null>>([null, null])
+  const dhFrontRef = useRef(0)
   const handledDhRef = useRef(new Set<string>())
   const waitingDhRef = useRef<{ code: string; at: number } | null>(null)
   const dhQueueRef = useRef<string[]>([])
@@ -253,12 +264,18 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
   // Filler ("暖场") audio: pre-synthesized "嗯…" clips in the current voice.
   // open = the instant a reply is accepted (first frame is ~10s+ away);
   // mid  = when the segment queue runs dry while more is still rendering.
-  const warmVidRef = useRef<HTMLVideoElement | null>(null)
+  const warmLayersRef = useRef<Array<HTMLVideoElement | null>>([null, null])
+  const warmFrontRef = useRef(0)
   const warmRef = useRef<HTMLAudioElement | null>(null)
   const warmupRef = useRef<DhWarmup | null>(null)
   const warmMidCountRef = useRef(0)
   const warmMidAtRef = useRef(0)
   const warmLastOpenRef = useRef(0)
+  const warmLastIdxRef = useRef<{ open: number; mid: number }>({ open: -1, mid: -1 })
+  // When the LLM picker already spoke the opener for this turn (it fires the
+  // moment the user stops talking), the later dhSpeak warmup bundle must not
+  // say "嗯…" a second time.
+  const warmPickAtRef = useRef(0)
 
   // Drag-move state.
   const moveRef = useRef<{ startX: number; startY: number; base: { x: number; y: number } } | null>(null)
@@ -509,38 +526,141 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
     }
     void poll()
     const timer = window.setInterval(poll, 4000)
+    // 页面在后台时 Chrome 会把 4s 定时器压到 60s（intensive throttling）：
+    // 切回来的那一刻立刻补一次，否则已生成的段视频要再等一分钟才播。
+    const onVisibility = (): void => {
+      if (document.visibilityState === 'visible') void poll()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
     return () => {
       cancelled = true
       window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
     }
   }, [])
 
+  /** Pause + hide every layer of a pair (reset / stop path). */
+  const resetLayers = useCallback((layers: Array<HTMLVideoElement | null>): void => {
+    for (const el of layers) {
+      if (el === null) continue
+      el.pause()
+      el.currentTime = 0
+      el.style.opacity = '0'
+    }
+  }, [])
+
+  /**
+   * 双缓冲切换：把新片装进「不在前台」的那一层，等它真的解出一帧再交换。
+   *
+   * 原来是在同一个 <video> 上直接改 src：浏览器会立刻清空画面，新帧解码完
+   * 之前是黑的，而这时 opacity 已经在往 1 走 —— 每次换段、每次暖场接正片
+   * 都会「闪一下」。现在旧画面一直留着，直到新画面就绪才切。
+   */
+  const showClip = useCallback(
+    (
+      layers: Array<HTMLVideoElement | null>,
+      frontRef: { current: number },
+      src: string,
+      playEl?: (el: HTMLVideoElement) => void,
+    ): boolean => {
+      const next = 1 - frontRef.current
+      const to = layers[next]
+      const from = layers[frontRef.current]
+      if (to === null) return false
+
+      to.pause()
+      to.style.opacity = '0'
+      to.src = src
+      to.currentTime = 0
+
+      let swapped = false
+      const swap = (): void => {
+        if (swapped) return
+        swapped = true
+        frontRef.current = next
+        to.style.opacity = '1'
+        if (from !== null) from.style.opacity = '0'
+        if (playEl !== undefined) playEl(to)
+        else void to.play().catch(() => {})
+        if (from !== null) {
+          window.setTimeout(() => {
+            if (frontRef.current !== next) return
+            from.pause()
+            from.currentTime = 0
+          }, 600)
+        }
+      }
+
+      // 优先等「真的出了一帧」（requestVideoFrameCallback），退化到 loadeddata，
+      // 再兜底 900ms——网络卡住时也别让画面永远停在旧的那层。
+      const rvfc = (to as HTMLVideoElement & { requestVideoFrameCallback?: (cb: () => void) => number })
+        .requestVideoFrameCallback
+      to.addEventListener(
+        'loadeddata',
+        () => {
+          if (typeof rvfc === 'function') rvfc.call(to, () => swap())
+          else swap()
+        },
+        { once: true },
+      )
+      window.setTimeout(swap, 900)
+      to.load()
+      return true
+    },
+    [],
+  )
+
   /** Silence both filler layers (a real segment is taking over, or we stop). */
   const stopWarmup = useCallback(() => {
-    const clip = warmVidRef.current
-    if (clip !== null) {
-      clip.pause()
-      clip.currentTime = 0
-      clip.style.opacity = '0'
-    }
+    resetLayers(warmLayersRef.current)
     const audio = warmRef.current
     if (audio !== null) {
       audio.pause()
       audio.currentTime = 0
     }
-  }, [])
+  }, [resetLayers])
 
   const stopDh = useCallback(() => {
     dhHoldingRef.current = false
-    const vid = dhRef.current
-    if (vid !== null) {
-      vid.pause()
-      vid.currentTime = 0
-      vid.style.opacity = '0'
-    }
+    resetLayers(dhLayersRef.current)
     stopWarmup()
     setDhPlayingBoth(false)
-  }, [setDhPlayingBoth, stopWarmup])
+  }, [resetLayers, setDhPlayingBoth, stopWarmup])
+
+  /** Start a filler media element and REPORT what the browser did with it.
+   *
+   * Chrome rejects `play()` on media with audio when the tab is hidden or has
+   * no user activation — the file still downloads (bridge log shows 200/206),
+   * so a silent failure looks identical to "never triggered". Report the
+   * outcome so the bridge log tells them apart; on rejection retry muted so the
+   * picture at least moves, then try to unmute and see if policy bounces it. */
+  const kickWarmup = useCallback((el: HTMLMediaElement, kind: 'open' | 'mid'): void => {
+    const hidden = document.visibilityState !== 'visible'
+    const playing = el.play()
+    if (playing === undefined) return
+    playing
+      .then(() => reportWarmup({ ok: true, kind, hidden }))
+      .catch((err: unknown) => {
+        el.muted = true
+        const retry = el.play()
+        if (retry === undefined) return
+        void retry
+          .then(() => {
+            el.muted = false
+            window.setTimeout(() => {
+              reportWarmup({
+                ok: !el.paused,
+                kind,
+                hidden,
+                error: el.paused ? `unmute rejected: ${String(err)}` : `muted-then-unmuted: ${String(err)}`,
+              })
+            }, 400)
+          })
+          .catch((err2: unknown) => {
+            reportWarmup({ ok: false, kind, hidden, error: String(err2) })
+          })
+      })
+  }, [])
 
   /** Play one filler line (random pick). False when nothing is available.
    *  Prefers the lip-synced clip (she actually talks); falls back to audio-only
@@ -549,22 +669,45 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
     if (!readDigitalHuman()) return false
     const list = kind === 'open' ? warmupRef.current?.open : warmupRef.current?.mid
     if (list === undefined || list.length === 0) return false
-    const item = list[Math.floor(Math.random() * list.length)]
+    // 别连着两次播同一句（「嗯…」「嗯…」连着听很出戏）
+    let pick = Math.floor(Math.random() * list.length)
+    if (list.length > 1 && pick === warmLastIdxRef.current[kind]) pick = (pick + 1) % list.length
+    warmLastIdxRef.current[kind] = pick
+    const item = list[pick]
     if (item === undefined) return false
     const base = bridgeBase()
-    const clip = warmVidRef.current
-    if (item.video !== null && clip !== null) {
-      clip.src = `${base}${item.video}`
-      clip.style.opacity = '1'
-      void clip.play().catch(() => {})
-      return true
+    if (item.video !== null) {
+      const shown = showClip(warmLayersRef.current, warmFrontRef, `${base}${item.video}`, (el) => {
+        kickWarmup(el, kind)
+      })
+      if (shown) return true
     }
     const audio = warmRef.current
     if (audio === null) return false
     audio.src = `${base}${item.audio}`
-    void audio.play().catch(() => {})
+    kickWarmup(audio, kind)
     return true
-  }, [])
+  }, [kickWarmup, showClip])
+
+  // A reply was accepted by the bridge: speak up IMMEDIATELY. The first video
+  // segment is ten-plus seconds away, and total silence reads as "disconnected".
+  // Any leftover segment from the previous reply is cut first so the two audio
+  // tracks never overlap.
+  useEffect(() => {
+    return onDhWarmupPick((pick) => {
+      // 用户刚说完，桥接挑好了一组暖场（模型优先、规则兜底）：立刻开口。
+      // 这条路径比 dhSpeak 早得多——不用等回复生成完。
+      warmupRef.current = { open: [pick.open], mid: pick.mid, max_mid: pick.max_mid }
+      warmMidCountRef.current = 0
+      warmMidAtRef.current = 0
+      dhPendingRef.current = true
+      warmPickAtRef.current = Date.now()
+      warmLastOpenRef.current = Date.now()
+      if (!readDigitalHuman()) return
+      stopDh()
+      playWarmup('open')
+    })
+  }, [playWarmup, stopDh])
 
   // A reply was accepted by the bridge: speak up IMMEDIATELY. The first video
   // segment is ten-plus seconds away, and total silence reads as "disconnected".
@@ -573,6 +716,9 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
   useEffect(() => {
     return onDhWarmup((warmup) => {
       warmupRef.current = warmup
+      // 这一轮的开场已经由 pick 播过了（用户说完就发起的那次）：只更新清单，
+      // 别再「嗯」一次，也别把正在播的画面掐掉。
+      if (Date.now() - warmPickAtRef.current < 30000) return
       warmMidCountRef.current = 0
       warmMidAtRef.current = 0
       // 受理即视为「还在生成」：状态轮询要 4s 才跟上，暖场续接不能等它
@@ -615,19 +761,17 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
 
   /** Play the next queued segment video (or stop when the playlist is done). */
   const playNextDh = useCallback(() => {
-    const vid = dhRef.current
     const next = dhQueueRef.current[dhQueuePlayedRef.current]
-    if (vid === null || next === undefined) {
+    if (next === undefined) {
       setDhPlayingBoth(false)
       return
     }
     // 正片到了：暖场必须立刻闭嘴（它是占位用的，绝不能盖住真实语音）
     stopWarmup()
-    vid.style.opacity = '1'
-    vid.src = next
-    void vid.play().catch(() => {})
+    // 先置「在播」，避免 4s 轮询在换层期间又调一次 playNextDh 把画面打乱
     setDhPlayingBoth(true)
-  }, [setDhPlayingBoth, stopWarmup])
+    showClip(dhLayersRef.current, dhFrontRef, next)
+  }, [setDhPlayingBoth, showClip, stopWarmup])
 
   const driveDh = (status: DhStatus): void => {
     const code = status.code
@@ -718,14 +862,9 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
   // overlaps the live TTS.
   useEffect(() => {
     if (!speaking || !dhPlaying) return
-    const vid = dhRef.current
-    if (vid !== null) {
-      vid.pause()
-      vid.currentTime = 0
-      vid.style.opacity = '0'
-    }
+    resetLayers(dhLayersRef.current)
     setDhPlayingBoth(false)
-  }, [speaking, dhPlaying, setDhPlayingBoth])
+  }, [speaking, dhPlaying, setDhPlayingBoth, resetLayers])
 
   const onDhEnded = useCallback(() => {
     dhQueuePlayedRef.current += 1
@@ -733,7 +872,7 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       playNextDh()
       return
     }
-    const vid = dhRef.current
+    const vid = dhLayersRef.current[dhFrontRef.current]
     if (dhPendingRef.current && vid !== null) {
       // 还有后续段在生成：停在当前段最后一帧等它，别掉回待机动画。
       // 同时补一句暖场语音——画面停住 + 有声音，才像「在想」而不是卡死。
@@ -743,9 +882,9 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       return
     }
     setDhPlayingBoth(false)
-    if (vid !== null) vid.style.opacity = '0'
+    resetLayers(dhLayersRef.current)
     stopWarmup()  // 整条回复播完：暖场那帧也收掉，回到待机动画
-  }, [playNextDh, setDhPlayingBoth, maybeMidWarmup, stopWarmup])
+  }, [playNextDh, setDhPlayingBoth, maybeMidWarmup, stopWarmup, resetLayers])
 
   /** A filler line finished but we are still waiting: top it up (bounded). */
   const onWarmEnded = useCallback(() => {
@@ -904,11 +1043,51 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       <video ref={bgB} style={VIDEO_STYLE} muted playsInline preload="auto" draggable={false} onEnded={onBgVideoEnded} />
       {/* Foreground task/avatar frame (load on demand) */}
       <video ref={taskRef} style={VIDEO_STYLE} muted playsInline preload="metadata" draggable={false} onEnded={onTaskEnded} />
-      {/* Digital-human frame (load on demand, carries the TTS audio) */}
-      <video ref={dhRef} style={VIDEO_STYLE} playsInline preload="metadata" draggable={false} onEnded={onDhEnded} />
-      {/* Filler clip: pre-rendered lip-synced "嗯…" in the SAME avatar, so the
-          gap looks like her thinking instead of a frozen/idle background. */}
-      <video ref={warmVidRef} style={VIDEO_STYLE} playsInline preload="auto" draggable={false} onEnded={onWarmEnded} />
+      {/* Digital-human segments: an A/B pair. The next clip is loaded into the
+          hidden layer and only swapped in once it has a frame, so switching
+          segments never shows a blank/black frame. */}
+      <video
+        ref={el => {
+          dhLayersRef.current[0] = el
+        }}
+        style={DH_VIDEO_STYLE}
+        playsInline
+        preload="auto"
+        draggable={false}
+        onEnded={onDhEnded}
+      />
+      <video
+        ref={el => {
+          dhLayersRef.current[1] = el
+        }}
+        style={DH_VIDEO_STYLE}
+        playsInline
+        preload="auto"
+        draggable={false}
+        onEnded={onDhEnded}
+      />
+      {/* Filler clips (also A/B): pre-rendered lip-synced "嗯…" in the SAME
+          avatar, so the gap looks like her thinking instead of looking dead. */}
+      <video
+        ref={el => {
+          warmLayersRef.current[0] = el
+        }}
+        style={DH_VIDEO_STYLE}
+        playsInline
+        preload="auto"
+        draggable={false}
+        onEnded={onWarmEnded}
+      />
+      <video
+        ref={el => {
+          warmLayersRef.current[1] = el
+        }}
+        style={DH_VIDEO_STYLE}
+        playsInline
+        preload="auto"
+        draggable={false}
+        onEnded={onWarmEnded}
+      />
       {/* Audio-only fallback while the clip above has not been rendered yet. */}
       <audio ref={warmRef} preload="auto" onEnded={onWarmEnded} style={WARMUP_AUDIO_STYLE} />
       {/* 只在失败/取消时给一行提示。生成中的「第 N/M 段」进度和进度条已移除，

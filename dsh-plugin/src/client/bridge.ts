@@ -115,6 +115,72 @@ export function onDhWarmup(cb: (warmup: DhWarmup) => void): () => void {
   }
 }
 
+/** One filler choice made for a user turn (LLM preferred, rule fallback). */
+export interface DhWarmupPick {
+  ok: boolean
+  source: 'llm' | 'rule' | 'empty' | 'off'
+  ms: number
+  open: DhWarmupItem
+  mid: DhWarmupItem[]
+  max_mid: number
+}
+
+let pickListener: ((pick: DhWarmupPick) => void) | null = null
+
+/** Subscribe to warmup choices (single consumer: the companion player). */
+export function onDhWarmupPick(cb: (pick: DhWarmupPick) => void): () => void {
+  pickListener = cb
+  return () => {
+    if (pickListener === cb) pickListener = null
+  }
+}
+
+/**
+ * Ask the bridge to pick fillers for ONE user turn — fired the moment the user
+ * stops talking, IN PARALLEL with the real answer. The request only makes the
+ * model emit a few tokens, while the first video segment is ten-plus seconds
+ * away, so this latency is free.
+ */
+export async function dhPickWarmup(text: string): Promise<DhWarmupPick | null> {
+  try {
+    const resp = await fetch(`${bridgeBase()}/api/dh/warmup/pick`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+    if (!resp.ok) return null
+    const json = (await resp.json()) as DhWarmupPick
+    if (json.ok !== true) return null
+    pickListener?.(json)
+    return json
+  } catch {
+    return null // the caller already has a rule-based fallback on the bridge
+  }
+}
+
+/**
+ * Report the outcome of a filler playback attempt back to the bridge.
+ *
+ * Browsers reject `play()` on media with sound when the page is not visible /
+ * has no user activation — the file still downloads (200/206 in the bridge
+ * log) but nothing is heard. Without this report it is impossible to tell
+ * "never played" from "played but muted by policy".
+ */
+export function reportWarmup(result: {
+  ok: boolean
+  kind: string
+  error?: string
+  hidden: boolean
+}): void {
+  void fetch(`${bridgeBase()}/api/dh/warmup/report`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(result),
+  }).catch(() => {
+    // diagnostics only — never break playback over this
+  })
+}
+
 /**
  * Digital human: submit a finished reply text so the bridge synthesizes it
  * with the same TTS voice and renders a lip-synced talking-head video (DUIX).
